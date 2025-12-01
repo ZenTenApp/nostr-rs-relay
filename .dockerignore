@@ -1,0 +1,13 @@
+target/
+.git/
+.gitignore
+*.db
+*.db-shm
+*.db-wal
+data/
+*.log
+.DS_Store
+*.swp
+*.swo
+*~
+

@@ -1,0 +1,30 @@
+services:
+  nostr-relay-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: nostr-relay-dev
+    ports:
+      - "8081:8080"
+    volumes:
+      # Mount source code for hot reloading (read-write for cargo to access)
+      - ./src:/usr/src/app/src
+      - ./proto:/usr/src/app/proto
+      - ./Cargo.toml:/usr/src/app/Cargo.toml
+      - ./Cargo.lock:/usr/src/app/Cargo.lock
+      - ./build.rs:/usr/src/app/build.rs
+      # Mount config and data directories
+      - ./config.toml:/usr/src/app/config.toml:ro
+      - ./data:/usr/src/app/db
+      # Mount target directory to persist build artifacts (speeds up rebuilds)
+      - rust-cache:/usr/src/app/target
+    environment:
+      - RUST_LOG=info,nostr_rs_relay=info
+      - RUST_BACKTRACE=1
+    stdin_open: true
+    tty: true
+
+volumes:
+  rust-cache:
+    driver: local
+

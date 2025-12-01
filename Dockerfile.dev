@@ -1,0 +1,35 @@
+FROM docker.io/library/rust:1-bookworm
+
+# Install build dependencies
+RUN apt-get update \
+    && apt-get install -y cmake protobuf-compiler pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install cargo-watch for hot reloading
+RUN cargo install cargo-watch
+
+WORKDIR /usr/src/app
+
+# Copy dependency files first for better caching
+COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY proto ./proto
+
+# Pre-build dependencies (this layer will be cached)
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src
+
+# Copy source code
+COPY src ./src
+COPY proto ./proto
+
+# Expose the port
+EXPOSE 8080
+
+# Use cargo-watch to rebuild and run on file changes
+# Watch for changes in src/, proto/, and Cargo.toml
+# Pass config file if it exists, otherwise use defaults
+CMD ["cargo", "watch", "-x", "run --bin nostr-rs-relay -- --db /usr/src/app/db --config /usr/src/app/config.toml"]
+
