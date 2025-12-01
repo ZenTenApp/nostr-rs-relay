@@ -2,6 +2,7 @@
 use crate::payment::Processor;
 use config::{Config, ConfigError, File};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -179,6 +180,296 @@ pub struct Logging {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(unused)]
+pub struct KindFiltersConfig {
+    pub config_file: Option<String>,
+}
+
+impl Default for KindFiltersConfig {
+    fn default() -> Self {
+        KindFiltersConfig {
+            config_file: None,
+        }
+    }
+}
+
+/// Access rule for write/read permissions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessRule {
+    /// Allow all ("*")
+    All,
+    /// Deny all ("none")
+    None,
+    /// Allow/deny specific identifiers (pubkeys or special identifiers)
+    List(Vec<String>),
+}
+
+impl AccessRule {
+    /// Parse access rule from JSON value
+    pub fn from_json_value(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::String(s) => {
+                if s == "*" {
+                    AccessRule::All
+                } else if s == "none" {
+                    AccessRule::None
+                } else {
+                    AccessRule::List(vec![s.clone()])
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                let list: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                AccessRule::List(list)
+            }
+            _ => AccessRule::None,
+        }
+    }
+}
+
+/// Tag requirement specification
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagRequirement {
+    /// Tag not required ("none")
+    None,
+    /// Tag required with any value
+    Required,
+    /// Tag required with hex-encoded value
+    RequiredHex,
+}
+
+impl TagRequirement {
+    /// Parse tag requirement from string
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "none" => TagRequirement::None,
+            "hex" => TagRequirement::RequiredHex,
+            _ => TagRequirement::Required,
+        }
+    }
+}
+
+/// Rate limit configuration
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// Events per minute
+    pub events_per_minute: u32,
+}
+
+impl RateLimitConfig {
+    /// Parse rate limit from string ("none" or "N/min" format)
+    pub fn from_str(s: &str) -> Option<Self> {
+        if s == "none" {
+            return None;
+        }
+        // Parse format like "10/min" or "10/minute"
+        if let Some(slash_pos) = s.find('/') {
+            let num_str = &s[..slash_pos].trim();
+            if let Ok(num) = num_str.parse::<u32>() {
+                return Some(RateLimitConfig {
+                    events_per_minute: num,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// Expiration configuration
+#[derive(Debug, Clone)]
+pub struct ExpirationConfig {
+    /// Duration after which events expire, or None for "never"
+    pub duration: Option<Duration>,
+}
+
+impl ExpirationConfig {
+    /// Parse expiration from string ("never", "1h", "30m", etc.)
+    pub fn from_str(s: &str) -> Self {
+        if s == "never" {
+            ExpirationConfig { duration: None }
+        } else {
+            ExpirationConfig {
+                duration: parse_duration::parse(s).ok(),
+            }
+        }
+    }
+}
+
+/// Per-kind filter configuration
+#[derive(Debug, Clone)]
+pub struct KindFilterConfig {
+    pub description: Option<String>,
+    pub write_deny: AccessRule,
+    pub write_allow: AccessRule,
+    pub read_deny: AccessRule,
+    pub read_allow: AccessRule,
+    pub max_size: Option<usize>,
+    pub rate_limit: Option<RateLimitConfig>,
+    pub expiration: ExpirationConfig,
+    pub d_tag: TagRequirement,
+    pub p_tag: TagRequirement,
+}
+
+/// Kind filters configuration container
+#[derive(Debug, Clone)]
+pub struct KindFilters {
+    pub config_file: Option<String>,
+    pub filters: HashMap<u64, KindFilterConfig>,
+}
+
+impl KindFilters {
+    /// Create empty kind filters
+    pub fn new() -> Self {
+        KindFilters {
+            config_file: None,
+            filters: HashMap::new(),
+        }
+    }
+
+    /// Load kind filters from JSON file
+    pub fn load_from_file(file_path: &str) -> Result<Self, String> {
+        use std::fs;
+        let contents = fs::read_to_string(file_path)
+            .map_err(|e| format!("Failed to read kind filters file {}: {}", file_path, e))?;
+        let json: serde_json::Value = serde_json::from_str(&contents)
+            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+        let mut filters = HashMap::new();
+
+        // Get the list of kinds
+        let kinds: &Vec<serde_json::Value> = json
+            .get("kinds")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "Missing 'kinds' array in JSON".to_string())?;
+
+        for kind_value in kinds {
+            let kind_str = kind_value
+                .as_str()
+                .ok_or_else(|| "Kind must be a string".to_string())?;
+            let kind: u64 = kind_str
+                .parse()
+                .map_err(|_| format!("Invalid kind number: {}", kind_str))?;
+
+            let kind_config = json
+                .get(kind_str)
+                .ok_or_else(|| format!("Missing configuration for kind {}", kind_str))?;
+
+            let config = KindFilterConfig::from_json_value(kind_config)?;
+            filters.insert(kind, config);
+        }
+
+        Ok(KindFilters {
+            config_file: Some(file_path.to_string()),
+            filters,
+        })
+    }
+}
+
+impl Default for KindFilters {
+    fn default() -> Self {
+        KindFilters::new()
+    }
+}
+
+impl KindFilterConfig {
+    /// Parse kind filter config from JSON value
+    fn from_json_value(value: &serde_json::Value) -> Result<Self, String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "Kind filter config must be an object".to_string())?;
+
+        let description = obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let write_deny: AccessRule = obj
+            .get("write_deny")
+            .map(AccessRule::from_json_value)
+            .unwrap_or_else(|| AccessRule::None);
+
+        let write_allow: AccessRule = obj
+            .get("write_allow")
+            .map(AccessRule::from_json_value)
+            .unwrap_or_else(|| AccessRule::All);
+
+        let read_deny: AccessRule = obj
+            .get("read_deny")
+            .map(AccessRule::from_json_value)
+            .unwrap_or_else(|| AccessRule::None);
+
+        let read_allow: AccessRule = obj
+            .get("read_allow")
+            .map(AccessRule::from_json_value)
+            .unwrap_or_else(|| AccessRule::All);
+
+        let max_size: Option<usize> = obj
+            .get("max_size")
+            .and_then(|v| v.as_str())
+            .and_then(parse_size_string);
+
+        let rate_limit: Option<RateLimitConfig> = obj
+            .get("rate_limit")
+            .and_then(|v| v.as_str())
+            .and_then(|s| RateLimitConfig::from_str(s));
+
+        let expiration: ExpirationConfig = obj
+            .get("expiration")
+            .and_then(|v| v.as_str())
+            .map(|s| ExpirationConfig::from_str(s))
+            .unwrap_or_else(|| ExpirationConfig::from_str("never"));
+
+        let d_tag: TagRequirement = obj
+            .get("d_tag")
+            .and_then(|v| v.as_str())
+            .map(|s| TagRequirement::from_str(s))
+            .unwrap_or_else(|| TagRequirement::None);
+
+        let p_tag: TagRequirement = obj
+            .get("p_tag")
+            .and_then(|v| v.as_str())
+            .map(|s| TagRequirement::from_str(s))
+            .unwrap_or_else(|| TagRequirement::None);
+
+        Ok(KindFilterConfig {
+            description,
+            write_deny,
+            write_allow,
+            read_deny,
+            read_allow,
+            max_size,
+            rate_limit,
+            expiration,
+            d_tag,
+            p_tag,
+        })
+    }
+}
+
+/// Parse size string like "1MB", "512KB" to bytes
+fn parse_size_string(s: &str) -> Option<usize> {
+    let s: String = s.trim().to_uppercase();
+    if s.ends_with("KB") {
+        let num_str: &str = &s[..s.len() - 2];
+        num_str.parse::<usize>().ok().map(|n: usize| n * 1024)
+    } else if s.ends_with("MB") {
+        let num_str: &str = &s[..s.len() - 2];
+        num_str.parse::<usize>().ok().map(|n: usize| n * 1024 * 1024)
+    } else if s.ends_with("GB") {
+        let num_str: &str = &s[..s.len() - 2];
+        num_str.parse::<usize>().ok().map(|n: usize| n * 1024 * 1024 * 1024)
+    } else if s.ends_with('B') {
+        let num_str: &str = &s[..s.len() - 1];
+        num_str.parse::<usize>().ok()
+    } else {
+        // Try parsing as plain number (assume bytes)
+        s.parse::<usize>().ok()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(unused)]
 pub struct Settings {
     pub info: Info,
     pub diagnostics: Diagnostics,
@@ -192,6 +483,9 @@ pub struct Settings {
     pub retention: Retention,
     pub options: Options,
     pub logging: Logging,
+    pub kind_filters_config: KindFiltersConfig,
+    #[serde(skip)]
+    pub kind_filters: KindFilters,
 }
 
 impl Settings {
@@ -232,6 +526,22 @@ impl Settings {
             .add_source(File::with_name(config))
             .build()?;
         let mut settings: Settings = config.try_deserialize()?;
+        
+        // Load kind filters if configured
+        if let Some(config_file) = &settings.kind_filters_config.config_file {
+            match KindFilters::load_from_file(config_file) {
+                Ok(kind_filters) => {
+                    settings.kind_filters = kind_filters;
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to load kind filters from {}: {}", config_file, e);
+                    settings.kind_filters = KindFilters::new();
+                }
+            }
+        } else {
+            settings.kind_filters = KindFilters::new();
+        }
+        
         // ensure connection pool size is logical
         assert!(
             settings.database.min_conn <= settings.database.max_conn,
@@ -362,6 +672,10 @@ impl Default for Settings {
             logging: Logging {
                 folder_path: None,
                 file_prefix: None,
+            },
+            kind_filters: KindFilters::new(),
+            kind_filters_config: KindFiltersConfig {
+                config_file: None,
             },
         }
     }

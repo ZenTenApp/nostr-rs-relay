@@ -251,3 +251,8 @@ limit_scrapers = false
 
 # optional if `direct_message=false`
 #secret_key = "<nostr nsec>"
+
+[kind_filters_config]
+# Path to JSON file containing per-kind filter configurations
+# If not specified, kind filters are disabled
+#config_file = "kind_filters.json"
