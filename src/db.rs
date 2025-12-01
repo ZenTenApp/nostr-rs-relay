@@ -2,6 +2,7 @@
 use crate::config::Settings;
 use crate::error::{Error, Result};
 use crate::event::Event;
+use crate::kind_filters::{check_access_rule, validate_d_tag, validate_p_tag};
 use crate::nauthz;
 use crate::notice::Notice;
 use crate::payment::PaymentMessage;
@@ -18,6 +19,7 @@ use r2d2;
 use sqlx::pool::PoolOptions;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::ConnectOptions;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -134,6 +136,21 @@ pub async fn db_writer(
             lim_opt = Some(RateLimiter::direct(Quota::per_minute(quota)));
         }
     }
+
+    // Create per-kind rate limiters
+    let mut kind_rate_limiters: HashMap<u64, RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::QuantaClock, governor::middleware::NoOpMiddleware<governor::clock::QuantaInstant>>> = HashMap::new();
+    for (kind, filter_config) in &settings.kind_filters.filters {
+        if let Some(rate_limit) = &filter_config.rate_limit {
+            let quota: std::num::NonZero<u32> = core::num::NonZeroU32::new(rate_limit.events_per_minute).unwrap();
+            let limiter = RateLimiter::direct(Quota::per_minute(quota));
+            kind_rate_limiters.insert(*kind, limiter);
+            info!(
+                "Enabling per-kind rate limit for kind {}: {}/min",
+                kind, rate_limit.events_per_minute
+            );
+        }
+    }
+
     // create a client if GRPC is enabled.
     // Check with externalized event admitter service, if one is defined.
     let mut grpc_client = if let Some(svr) = settings.grpc.event_admission_server {
@@ -340,6 +357,13 @@ pub async fn db_writer(
         let nip05_address: Option<crate::nip05::Nip05Name> =
             validation.and_then(|x| x.ok().map(|y| y.name));
 
+        // Convert auth_pubkey from Vec<u8> to hex string if available (before GRPC call)
+        let auth_pubkey_hex = subm_event
+            .auth_pubkey
+            .as_ref()
+            .map(|pk| hex::encode(pk));
+        let auth_pubkey_str = auth_pubkey_hex.as_deref();
+
         // GRPC check
         if let Some(ref mut c) = grpc_client {
             trace!("checking if grpc permits");
@@ -377,6 +401,125 @@ pub async fn db_writer(
                 }
                 Err(e) => {
                     warn!("GRPC server error: {:?}", e);
+                }
+            }
+        }
+
+        // Kind filter write check
+        if let Some(filter_config) = settings.kind_filters.filters.get(&event.kind) {
+
+            // Get server pubkey from settings if available
+            let server_pubkey = settings.info.pubkey.as_deref();
+
+            // Check write access rules
+            let write_allowed = check_access_rule(
+                &filter_config.write_allow,
+                &event,
+                auth_pubkey_str,
+                server_pubkey,
+            );
+            let write_denied = check_access_rule(
+                &filter_config.write_deny,
+                &event,
+                auth_pubkey_str,
+                server_pubkey,
+            );
+
+            // Deny takes precedence over allow
+            if write_denied || !write_allowed {
+                let reason = if write_denied {
+                    "write denied by kind filter"
+                } else {
+                    "write not allowed by kind filter"
+                };
+                debug!(
+                    "rejecting event: {} (kind: {}), reason: {}",
+                    event.get_event_id_prefix(),
+                    event.kind,
+                    reason
+                );
+                notice_tx
+                    .try_send(Notice::blocked(event.id, reason))
+                    .ok();
+                continue;
+            }
+
+            // Check size limit
+            if let Some(max_size) = filter_config.max_size {
+                let event_json = serde_json::to_string(&event).unwrap_or_default();
+                if event_json.len() > max_size {
+                    debug!(
+                        "rejecting event: {} (kind: {}), size {} exceeds limit {}",
+                        event.get_event_id_prefix(),
+                        event.kind,
+                        event_json.len(),
+                        max_size
+                    );
+                    notice_tx
+                        .try_send(Notice::blocked(
+                            event.id,
+                            &format!("event size exceeds limit of {} bytes", max_size),
+                        ))
+                        .ok();
+                    continue;
+                }
+            }
+
+            // Check tag requirements
+            if !validate_d_tag(&event, &filter_config.d_tag) {
+                debug!(
+                    "rejecting event: {} (kind: {}), d tag requirement not met",
+                    event.get_event_id_prefix(),
+                    event.kind
+                );
+                notice_tx
+                    .try_send(Notice::blocked(event.id, "d tag requirement not met"))
+                    .ok();
+                continue;
+            }
+
+            if !validate_p_tag(&event, &filter_config.p_tag) {
+                debug!(
+                    "rejecting event: {} (kind: {}), p tag requirement not met",
+                    event.get_event_id_prefix(),
+                    event.kind
+                );
+                notice_tx
+                    .try_send(Notice::blocked(event.id, "p tag requirement not met"))
+                    .ok();
+                continue;
+            }
+
+            // Check expiration
+            if let Some(expiration_duration) = filter_config.expiration.duration {
+                // Check if event has expired based on created_at + expiration duration
+                let now = crate::utils::unix_time();
+                let expiration_time = event.created_at + expiration_duration.as_secs();
+                if now > expiration_time {
+                    debug!(
+                        "rejecting event: {} (kind: {}), event has expired",
+                        event.get_event_id_prefix(),
+                        event.kind
+                    );
+                    notice_tx
+                        .try_send(Notice::blocked(event.id, "event has expired"))
+                        .ok();
+                    continue;
+                }
+            }
+
+            // Check per-kind rate limit
+            if let Some(rate_limiter) = kind_rate_limiters.get(&event.kind) {
+                if rate_limiter.check().is_err() {
+                    debug!(
+                        "rejecting event: {} (kind: {}), rate limit exceeded",
+                        event.get_event_id_prefix(),
+                        event.kind
+                    );
+                    notice_tx
+                        .try_send(Notice::blocked(event.id, "rate limit exceeded for this kind"))
+                        .ok();
+                    continue;
                 }
             }
         }

@@ -1058,21 +1058,58 @@ fn make_notice_message(notice: &Notice) -> Message {
 
 fn allowed_to_send(event_str: &str, conn: &conn::ClientConn, settings: &Settings) -> bool {
     // TODO: pass in kind so that we can avoid deserialization for most events
-    if settings.authorization.nip42_dms {
-        match serde_json::from_str::<Event>(event_str) {
-            Ok(event) => {
-                if event.kind == 4 || event.kind == 44 || event.kind == 1059 {
-                    match (conn.auth_pubkey(), event.tag_values_by_name("p").first()) {
-                        (Some(auth_pubkey), Some(recipient_pubkey)) => {
-                            recipient_pubkey == auth_pubkey || &event.pubkey == auth_pubkey
-                        }
-                        (_, _) => false,
-                    }
-                } else {
-                    true
-                }
+    let event: Event = match serde_json::from_str(event_str) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    // Check kind filter read access
+    if let Some(filter_config) = settings.kind_filters.filters.get(&event.kind) {
+        let auth_pubkey_str = conn.auth_pubkey().map(|s| s.as_str());
+        let server_pubkey = settings.info.pubkey.as_deref();
+
+        // Check read access rules
+        let read_allowed = crate::kind_filters::check_access_rule(
+            &filter_config.read_allow,
+            &event,
+            auth_pubkey_str,
+            server_pubkey,
+        );
+        let read_denied = crate::kind_filters::check_access_rule(
+            &filter_config.read_deny,
+            &event,
+            auth_pubkey_str,
+            server_pubkey,
+        );
+
+        // Deny takes precedence over allow
+        if read_denied || !read_allowed {
+            return false;
+        }
+
+        // Check expiration on read
+        if let Some(expiration_duration) = filter_config.expiration.duration {
+            let now = crate::utils::unix_time();
+            let expiration_time = event.created_at + expiration_duration.as_secs();
+            if now > expiration_time {
+                // Event has expired, don't send it
+                return false;
             }
-            Err(_) => false,
+        }
+    }
+
+    // Existing DM filtering logic
+    if settings.authorization.nip42_dms {
+        if event.kind == 4 || event.kind == 44 || event.kind == 1059 {
+            let p_tags = event.tag_values_by_name("p");
+            match (conn.auth_pubkey(), p_tags.first().map(|s| s.as_str())) {
+                (Some(auth_pubkey), Some(recipient_pubkey)) => {
+                    recipient_pubkey == auth_pubkey || &event.pubkey == auth_pubkey
+                }
+                (_, _) => false,
+            }
+        } else {
+            true
         }
     } else {
         true
