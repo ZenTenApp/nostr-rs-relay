@@ -1,8 +1,10 @@
 //! Configuration file and settings management
 use crate::payment::Processor;
 use config::{Config, ConfigError, File};
+use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -296,14 +298,21 @@ impl ExpirationConfig {
     }
 }
 
+/// Write/read configuration for a kind
+#[derive(Debug, Clone)]
+pub struct WriteReadConfig {
+    pub script: Option<String>,        // Path to executable script
+    pub allow: AccessRule,            // Allow rule (defaults to All)
+    pub deny: AccessRule,              // Deny rule (defaults to None)
+    pub privileged: bool,             // If true, allows parties_involved for read
+}
+
 /// Per-kind filter configuration
 #[derive(Debug, Clone)]
 pub struct KindFilterConfig {
     pub description: Option<String>,
-    pub write_deny: AccessRule,
-    pub write_allow: AccessRule,
-    pub read_deny: AccessRule,
-    pub read_allow: AccessRule,
+    pub write: Option<WriteReadConfig>,
+    pub read: Option<WriteReadConfig>,
     pub max_size: Option<usize>,
     pub rate_limit: Option<RateLimitConfig>,
     pub expiration: ExpirationConfig,
@@ -315,6 +324,8 @@ pub struct KindFilterConfig {
 #[derive(Debug, Clone)]
 pub struct KindFilters {
     pub config_file: Option<String>,
+    pub whitelist: Option<Vec<u64>>,
+    pub blacklist: Option<Vec<u64>>,
     pub filters: HashMap<u64, KindFilterConfig>,
 }
 
@@ -323,6 +334,8 @@ impl KindFilters {
     pub fn new() -> Self {
         KindFilters {
             config_file: None,
+            whitelist: None,
+            blacklist: None,
             filters: HashMap::new(),
         }
     }
@@ -336,23 +349,63 @@ impl KindFilters {
             .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
         let mut filters = HashMap::new();
+        let mut whitelist: Option<Vec<u64>> = None;
+        let mut blacklist: Option<Vec<u64>> = None;
 
-        // Get the list of kinds
-        let kinds: &Vec<serde_json::Value> = json
-            .get("kinds")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "Missing 'kinds' array in JSON".to_string())?;
+        // Parse kinds object: { "kinds": { "whitelist": [...], "blacklist": [...] } }
+        if let Some(kinds_value) = json.get("kinds") {
+            let kinds_obj = kinds_value
+                .as_object()
+                .ok_or_else(|| "kinds must be an object with whitelist and/or blacklist".to_string())?;
 
-        for kind_value in kinds {
-            let kind_str = kind_value
-                .as_str()
-                .ok_or_else(|| "Kind must be a string".to_string())?;
-            let kind: u64 = kind_str
-                .parse()
-                .map_err(|_| format!("Invalid kind number: {}", kind_str))?;
+            if let Some(whitelist_arr) = kinds_obj.get("whitelist") {
+                if let Some(arr) = whitelist_arr.as_array() {
+                    let mut wl = Vec::new();
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            if let Ok(k) = s.parse::<u64>() {
+                                wl.push(k);
+                            }
+                        } else if let Some(k) = v.as_u64() {
+                            wl.push(k);
+                        }
+                    }
+                    whitelist = Some(wl);
+                }
+            }
+            if let Some(blacklist_arr) = kinds_obj.get("blacklist") {
+                if let Some(arr) = blacklist_arr.as_array() {
+                    let mut bl = Vec::new();
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            if let Ok(k) = s.parse::<u64>() {
+                                bl.push(k);
+                            }
+                        } else if let Some(k) = v.as_u64() {
+                            bl.push(k);
+                        }
+                    }
+                    blacklist = Some(bl);
+                }
+            }
+        }
 
+        // Collect all kind numbers from the JSON keys (excluding "kinds")
+        let mut kind_numbers = Vec::new();
+        if let Some(obj) = json.as_object() {
+            for (key, _) in obj {
+                if key != "kinds" {
+                    if let Ok(kind) = key.parse::<u64>() {
+                        kind_numbers.push((key.clone(), kind));
+                    }
+                }
+            }
+        }
+
+        // Parse each kind configuration
+        for (kind_str, kind) in kind_numbers {
             let kind_config = json
-                .get(kind_str)
+                .get(&kind_str)
                 .ok_or_else(|| format!("Missing configuration for kind {}", kind_str))?;
 
             let config = KindFilterConfig::from_json_value(kind_config)?;
@@ -361,6 +414,8 @@ impl KindFilters {
 
         Ok(KindFilters {
             config_file: Some(file_path.to_string()),
+            whitelist,
+            blacklist,
             filters,
         })
     }
@@ -369,6 +424,42 @@ impl KindFilters {
 impl Default for KindFilters {
     fn default() -> Self {
         KindFilters::new()
+    }
+}
+
+impl WriteReadConfig {
+    /// Parse write/read config from JSON value
+    fn from_json_value(value: &serde_json::Value) -> Result<Self, String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "Write/read config must be an object".to_string())?;
+
+        let script = obj
+            .get("script")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let allow: AccessRule = obj
+            .get("allow")
+            .map(AccessRule::from_json_value)
+            .unwrap_or_else(|| AccessRule::All);
+
+        let deny: AccessRule = obj
+            .get("deny")
+            .map(AccessRule::from_json_value)
+            .unwrap_or_else(|| AccessRule::None);
+
+        let privileged = obj
+            .get("privileged")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok(WriteReadConfig {
+            script,
+            allow,
+            deny,
+            privileged,
+        })
     }
 }
 
@@ -384,25 +475,9 @@ impl KindFilterConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let write_deny: AccessRule = obj
-            .get("write_deny")
-            .map(AccessRule::from_json_value)
-            .unwrap_or_else(|| AccessRule::None);
-
-        let write_allow: AccessRule = obj
-            .get("write_allow")
-            .map(AccessRule::from_json_value)
-            .unwrap_or_else(|| AccessRule::All);
-
-        let read_deny: AccessRule = obj
-            .get("read_deny")
-            .map(AccessRule::from_json_value)
-            .unwrap_or_else(|| AccessRule::None);
-
-        let read_allow: AccessRule = obj
-            .get("read_allow")
-            .map(AccessRule::from_json_value)
-            .unwrap_or_else(|| AccessRule::All);
+        // Parse "write" and "read" objects
+        let write = obj.get("write").map(WriteReadConfig::from_json_value).transpose()?;
+        let read = obj.get("read").map(WriteReadConfig::from_json_value).transpose()?;
 
         let max_size: Option<usize> = obj
             .get("max_size")
@@ -434,10 +509,8 @@ impl KindFilterConfig {
 
         Ok(KindFilterConfig {
             description,
-            write_deny,
-            write_allow,
-            read_deny,
-            read_allow,
+            write,
+            read,
             max_size,
             rate_limit,
             expiration,
@@ -514,7 +587,7 @@ impl Settings {
         config_file_name: &Option<String>,
     ) -> Result<Self, ConfigError> {
         let default_config_file_name = "config.toml".to_string();
-        let config: &String = match config_file_name {
+        let config_path_str: &String = match config_file_name {
             Some(value) => value,
             None => &default_config_file_name,
         };
@@ -523,22 +596,68 @@ impl Settings {
             // use defaults
             .add_source(Config::try_from(default)?)
             // override with file contents
-            .add_source(File::with_name(config))
+            .add_source(File::with_name(config_path_str))
             .build()?;
         let mut settings: Settings = config.try_deserialize()?;
         
+        // Debug: log what we read from config (use eprintln since logging may not be initialized yet)
+        eprintln!("[Config] Kind filters config file setting: {:?}", settings.kind_filters_config.config_file);
+        
         // Load kind filters if configured
         if let Some(config_file) = &settings.kind_filters_config.config_file {
-            match KindFilters::load_from_file(config_file) {
+            // Resolve relative paths relative to the config file directory
+            let resolved_path = if Path::new(config_file).is_absolute() {
+                // Absolute path, use as-is
+                config_file.clone()
+            } else {
+                // Relative path - resolve relative to config file directory
+                let config_dir = Path::new(config_path_str)
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."));
+                config_dir.join(config_file).to_string_lossy().to_string()
+            };
+            
+            eprintln!("[Config] Attempting to load kind filters from: {}", resolved_path);
+            match KindFilters::load_from_file(&resolved_path) {
                 Ok(kind_filters) => {
+                    eprintln!("[Config] Loaded kind filters from {}", resolved_path);
+                    if let Some(ref whitelist) = kind_filters.whitelist {
+                        eprintln!("[Config]   Whitelist: {:?}", whitelist);
+                    }
+                    if let Some(ref blacklist) = kind_filters.blacklist {
+                        eprintln!("[Config]   Blacklist: {:?}", blacklist);
+                    }
+                    if kind_filters.whitelist.is_none() && kind_filters.blacklist.is_none() {
+                        eprintln!("[Config]   No whitelist or blacklist configured - all kinds allowed");
+                    }
+                    if !kind_filters.filters.is_empty() {
+                        eprintln!("[Config]   Configured kinds: {}", kind_filters.filters.len());
+                        for (kind, config) in &kind_filters.filters {
+                            let mut parts = Vec::new();
+                            if let Some(ref desc) = config.description {
+                                parts.push(format!("desc: {}", desc));
+                            }
+                            if config.write.is_some() {
+                                parts.push("write".to_string());
+                            }
+                            if config.read.is_some() {
+                                parts.push("read".to_string());
+                            }
+                            eprintln!("[Config]     Kind {}: {}", kind, parts.join(", "));
+                        }
+                    } else {
+                        eprintln!("[Config]   No per-kind configurations");
+                    }
                     settings.kind_filters = kind_filters;
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load kind filters from {}: {}", config_file, e);
+                    eprintln!("[Config] Error: Failed to load kind filters from {}: {}", resolved_path, e);
+                    eprintln!("[Config] Kind filtering will be disabled. All kinds will be allowed.");
                     settings.kind_filters = KindFilters::new();
                 }
             }
         } else {
+            eprintln!("[Config] No kind filters config file specified - kind filtering disabled");
             settings.kind_filters = KindFilters::new();
         }
         

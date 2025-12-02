@@ -1063,28 +1063,29 @@ fn allowed_to_send(event_str: &str, conn: &conn::ClientConn, settings: &Settings
         Err(_) => return false,
     };
 
+    // Check kind whitelist/blacklist first
+    if !crate::kind_filters::is_kind_allowed(event.kind, &settings.kind_filters) {
+        return false;
+    }
+
     // Check kind filter read access
     if let Some(filter_config) = settings.kind_filters.filters.get(&event.kind) {
         let auth_pubkey_str = conn.auth_pubkey().map(|s| s.as_str());
         let server_pubkey = settings.info.pubkey.as_deref();
 
-        // Check read access rules
-        let read_allowed = crate::kind_filters::check_access_rule(
-            &filter_config.read_allow,
-            &event,
-            auth_pubkey_str,
-            server_pubkey,
-        );
-        let read_denied = crate::kind_filters::check_access_rule(
-            &filter_config.read_deny,
-            &event,
-            auth_pubkey_str,
-            server_pubkey,
-        );
+        // Check read access using new structure
+        if let Some(ref read_config) = filter_config.read {
+            let read_allowed = crate::kind_filters::check_write_read_config(
+                read_config,
+                &event,
+                auth_pubkey_str,
+                server_pubkey,
+                true, // is_read = true
+            );
 
-        // Deny takes precedence over allow
-        if read_denied || !read_allowed {
-            return false;
+            if !read_allowed {
+                return false;
+            }
         }
 
         // Check expiration on read

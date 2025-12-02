@@ -2,7 +2,7 @@
 use crate::config::Settings;
 use crate::error::{Error, Result};
 use crate::event::Event;
-use crate::kind_filters::{check_access_rule, validate_d_tag, validate_p_tag};
+use crate::kind_filters::{check_write_read_config, is_kind_allowed, validate_d_tag, validate_p_tag};
 use crate::nauthz;
 use crate::notice::Notice;
 use crate::payment::PaymentMessage;
@@ -405,43 +405,45 @@ pub async fn db_writer(
             }
         }
 
+        // Check kind whitelist/blacklist first
+        if !is_kind_allowed(event.kind, &settings.kind_filters) {
+            debug!(
+                "rejecting event: {} (kind: {}), reason: kind not allowed by whitelist/blacklist",
+                event.get_event_id_prefix(),
+                event.kind
+            );
+            notice_tx
+                .try_send(Notice::blocked(event.id, "kind not allowed by whitelist/blacklist"))
+                .ok();
+            continue;
+        }
+
         // Kind filter write check
         if let Some(filter_config) = settings.kind_filters.filters.get(&event.kind) {
-
             // Get server pubkey from settings if available
             let server_pubkey = settings.info.pubkey.as_deref();
 
-            // Check write access rules
-            let write_allowed = check_access_rule(
-                &filter_config.write_allow,
-                &event,
-                auth_pubkey_str,
-                server_pubkey,
-            );
-            let write_denied = check_access_rule(
-                &filter_config.write_deny,
-                &event,
-                auth_pubkey_str,
-                server_pubkey,
-            );
-
-            // Deny takes precedence over allow
-            if write_denied || !write_allowed {
-                let reason = if write_denied {
-                    "write denied by kind filter"
-                } else {
-                    "write not allowed by kind filter"
-                };
-                debug!(
-                    "rejecting event: {} (kind: {}), reason: {}",
-                    event.get_event_id_prefix(),
-                    event.kind,
-                    reason
+            // Check write access using new structure
+            if let Some(ref write_config) = filter_config.write {
+                let write_allowed = check_write_read_config(
+                    write_config,
+                    &event,
+                    auth_pubkey_str,
+                    server_pubkey,
+                    false, // is_read = false for write
                 );
-                notice_tx
-                    .try_send(Notice::blocked(event.id, reason))
-                    .ok();
-                continue;
+
+                if !write_allowed {
+                    debug!(
+                        "rejecting event: {} (kind: {}), reason: write not allowed by kind filter",
+                        event.get_event_id_prefix(),
+                        event.kind
+                    );
+                    notice_tx
+                        .try_send(Notice::blocked(event.id, "write not allowed by kind filter"))
+                        .ok();
+                    continue;
+                }
             }
 
             // Check size limit
