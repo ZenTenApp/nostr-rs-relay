@@ -16,6 +16,7 @@ services:
       # Mount config and data directories
       - ./config.toml:/usr/src/app/config.toml:ro
       - ./data:/usr/src/app/db
+      - ./.config:/usr/src/app/.config:ro
       # Mount target directory to persist build artifacts (speeds up rebuilds)
       - rust-cache:/usr/src/app/target
     environment:

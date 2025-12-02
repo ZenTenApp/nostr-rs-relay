@@ -255,4 +255,4 @@ limit_scrapers = false
 [kind_filters_config]
 # Path to JSON file containing per-kind filter configurations
 # If not specified, kind filters are disabled
-#config_file = "kind_filters.json"
+config_file = ".config/kinds.json"

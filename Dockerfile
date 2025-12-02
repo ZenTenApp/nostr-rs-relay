@@ -37,7 +37,8 @@ ENV TZ=Etc/UTC \
 RUN groupadd $APP_USER \
     && useradd -g $APP_USER $APP_USER \
     && mkdir -p ${APP} \
-    && mkdir -p ${APP_DATA}
+    && mkdir -p ${APP_DATA} \
+    && mkdir -p ${APP}/.config
 
 COPY --from=builder /nostr-rs-relay/target/release/nostr-rs-relay ${APP}/nostr-rs-relay
 
