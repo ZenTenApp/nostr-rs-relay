@@ -1,7 +1,7 @@
 //! Client connection state
 use std::collections::HashMap;
 
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 use crate::close::Close;
@@ -165,12 +165,21 @@ impl ClientConn {
             }
             NoAuth => {
                 // unexpected AUTH request
+                info!(
+                    "AUTH failed (cid: {}): unexpected AUTH request (no challenge was sent)",
+                    self.get_client_prefix()
+                );
                 return Err(Error::AuthFailure);
             }
         }
         match event.validate() {
             Ok(_) => {
                 if event.kind != 22242 {
+                    info!(
+                        "AUTH failed (cid: {}): invalid event kind (expected 22242, got {})",
+                        self.get_client_prefix(),
+                        event.kind
+                    );
                     return Err(Error::AuthFailure);
                 }
 
@@ -178,6 +187,20 @@ impl ClientConn {
                 let past_cutoff = curr_time - 600; // 10 minutes
                 let future_cutoff = curr_time + 600; // 10 minutes
                 if event.created_at < past_cutoff || event.created_at > future_cutoff {
+                    let time_diff = if event.created_at > future_cutoff {
+                        event.created_at - future_cutoff
+                    } else {
+                        past_cutoff - event.created_at
+                    };
+                    info!(
+                        "AUTH timestamp validation failed (cid: {}): event timestamp={}, current_time={}, past_cutoff={}, future_cutoff={}, difference={} seconds",
+                        self.get_client_prefix(),
+                        event.created_at,
+                        curr_time,
+                        past_cutoff,
+                        future_cutoff,
+                        time_diff
+                    );
                     return Err(Error::AuthFailure);
                 }
 
@@ -196,10 +219,21 @@ impl ClientConn {
                 match (challenge, &self.auth) {
                     (Some(received_challenge), Challenge(sent_challenge)) => {
                         if received_challenge != sent_challenge {
+                            info!(
+                                "AUTH failed (cid: {}): challenge mismatch (received: {}, expected: {})",
+                                self.get_client_prefix(),
+                                received_challenge,
+                                sent_challenge
+                            );
                             return Err(Error::AuthFailure);
                         }
                     }
                     (_, _) => {
+                        info!(
+                            "AUTH failed (cid: {}): missing or invalid challenge tag (challenge found: {})",
+                            self.get_client_prefix(),
+                            challenge.is_some()
+                        );
                         return Err(Error::AuthFailure);
                     }
                 }
@@ -207,10 +241,22 @@ impl ClientConn {
                 match (relay.and_then(host_str), host_str(relay_url)) {
                     (Some(received_relay), Some(our_relay)) => {
                         if received_relay != our_relay {
+                            info!(
+                                "AUTH failed (cid: {}): relay URL mismatch (received: {}, expected: {})",
+                                self.get_client_prefix(),
+                                received_relay,
+                                our_relay
+                            );
                             return Err(Error::AuthFailure);
                         }
                     }
                     (_, _) => {
+                        info!(
+                            "AUTH failed (cid: {}): missing or invalid relay tag (relay tag found: {}, relay_url configured: {})",
+                            self.get_client_prefix(),
+                            relay.is_some(),
+                            !relay_url.is_empty()
+                        );
                         return Err(Error::AuthFailure);
                     }
                 }
@@ -223,7 +269,14 @@ impl ClientConn {
                 );
                 Ok(())
             }
-            Err(_) => Err(Error::AuthFailure),
+            Err(e) => {
+                info!(
+                    "AUTH failed (cid: {}): event validation error: {}",
+                    self.get_client_prefix(),
+                    e
+                );
+                Err(Error::AuthFailure)
+            }
         }
     }
 }
