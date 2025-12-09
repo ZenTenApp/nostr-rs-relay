@@ -207,10 +207,11 @@ pub enum AccessRule {
 
 impl AccessRule {
     /// Parse access rule from JSON value
+    /// Accepts "*" or "all" for All, "none" for None, or a list of identifiers
     pub fn from_json_value(value: &serde_json::Value) -> Self {
         match value {
             serde_json::Value::String(s) => {
-                if s == "*" {
+                if s == "*" || s == "all" {
                     AccessRule::All
                 } else if s == "none" {
                     AccessRule::None
