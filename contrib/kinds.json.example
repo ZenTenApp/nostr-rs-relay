@@ -1,0 +1,7 @@
+{
+  "1": {
+    "description": "Text notes",
+    "write": { "allow": "*" },
+    "read": { "allow": "*" }
+  }
+}

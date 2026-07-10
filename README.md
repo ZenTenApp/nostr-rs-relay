@@ -148,6 +148,12 @@ $ docker run -it -p 7000:8080 \
 Options include rate-limiting, event size limits, and network address
 settings.
 
+## Production Deployment (Native Build)
+
+For a full production setup on Ubuntu without Docker — native binary,
+systemd service, nginx TLS, firewall, and backups — see
+[Production Native Build](docs/production-native-build.md).
+
 ## Reverse Proxy Configuration
 
 For examples of putting the relay behind a reverse proxy (for TLS

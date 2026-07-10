@@ -1,14 +1,24 @@
 [Unit]
 Description=nostr-rs-relay
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=REPLACE_WITH_YOUR_USERNAME
+Type=simple
+User=nostr
+Group=nostr
 WorkingDirectory=/var/lib/nostr-rs-relay
 Environment=RUST_LOG=warn,nostr_rs_relay=info
-ExecStart=/usr/bin/nostr-rs-relay --config /etc/nostr-rs-relay/config.toml
+ExecStart=/usr/local/bin/nostr-rs-relay --config /etc/nostr-rs-relay/config.toml --db /var/lib/nostr-rs-relay
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/nostr-rs-relay
 
 [Install]
 WantedBy=multi-user.target
