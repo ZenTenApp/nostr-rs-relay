@@ -79,6 +79,7 @@ Both `write` and `read` support `allow` and `deny` rules:
 The same format applies to `deny`. Deny rules take precedence over allow rules.
 
 **Evaluation order:**
+
 1. Script execution (if present) - if script denies, access is denied
 2. Deny rule check - if denied, access is denied
 3. Allow rule check - if allowed, access is granted
@@ -88,6 +89,7 @@ The same format applies to `deny`. Deny rules take precedence over allow rules.
 When `privileged: true` is set in the `read` configuration, authenticated users can read events where their pubkey appears in the event's `p` tags, even if they're not explicitly in the `allow` list.
 
 This is useful for:
+
 - **Direct Messages (kind 4, 44, 1059)** - Recipients can read messages addressed to them
 - **Mentions** - Users can read notes that mention them
 - **Custom event types** - Any event where the user is a participant (listed in `p` tags)
@@ -105,6 +107,7 @@ This is useful for:
 ```
 
 In this example:
+
 - The sender (in `allow` list) can read
 - Any authenticated user whose pubkey is in the event's `p` tags can also read
 - All other users are denied
@@ -123,7 +126,8 @@ Each kind number (as a string) can have its own configuration section:
     "expiration": "10m",
     "rate_limit": "5/min",
     "d_tag": "none",
-    "p_tag": "none"
+    "p_tag": "none",
+    "required_tags": ["e"]
   }
 }
 ```
@@ -138,6 +142,7 @@ Each kind number (as a string) can have its own configuration section:
 - **`rate_limit`** (optional) - Rate limiting (see Rate Limiting section)
 - **`d_tag`** (optional) - Requirement for `d` tag (see Tag Requirements section)
 - **`p_tag`** (optional) - Requirement for `p` tag (see Tag Requirements section)
+- **`required_tags`** (optional) - List of tag names that must be present (see Tag Requirements section)
 
 ## Expiration
 
@@ -146,6 +151,7 @@ Events can be automatically expired (deleted) after a specified duration. This h
 **Format:** Duration string or `"never"`
 
 Examples:
+
 - `"never"` - Events never expire (default)
 - `"10m"` - Expire after 10 minutes
 - `"1h"` - Expire after 1 hour
@@ -168,6 +174,7 @@ Limit the maximum size of events for a specific kind. Events exceeding this size
 **Format:** Size string with unit (KB, MB, GB) or bytes
 
 Examples:
+
 - `"10MB"` - Maximum 10 megabytes
 - `"512KB"` - Maximum 512 kilobytes
 - `"1GB"` - Maximum 1 gigabyte
@@ -186,6 +193,7 @@ Examples:
 **Important:** Script paths in the JSON configuration must be relative to the root directory of the relay.
 
 Scripts can be used for custom access control logic. They receive:
+
 - **Event JSON** via stdin
 - **`AUTH_PUBKEY`** environment variable (if user is authenticated)
 
@@ -208,6 +216,7 @@ Limit the number of events that can be published per minute for a specific kind.
 **Format:** `"N/min"` or `"N/minute"` or `"none"`
 
 Examples:
+
 - `"10/min"` - Maximum 10 events per minute
 - `"5/minute"` - Maximum 5 events per minute
 - `"none"` - No rate limiting
@@ -255,6 +264,20 @@ Requirement for the `p` tag (used for pubkey references):
   }
 }
 ```
+
+### required_tags
+
+List of arbitrary tag names that must be present on the event. Each listed tag must exist with at least one value; there is no hex or value validation.
+
+```json
+{
+  "30023": {
+    "required_tags": ["e", "title"]
+  }
+}
+```
+
+If a required tag is missing, the event is rejected with a notice like `missing required tag: title`.
 
 ## Global Kind Whitelist/Blacklist
 

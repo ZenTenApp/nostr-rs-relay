@@ -319,6 +319,7 @@ pub struct KindFilterConfig {
     pub expiration: ExpirationConfig,
     pub d_tag: TagRequirement,
     pub p_tag: TagRequirement,
+    pub required_tags: Vec<String>,
 }
 
 /// Kind filters configuration container
@@ -508,6 +509,23 @@ impl KindFilterConfig {
             .map(|s| TagRequirement::from_str(s))
             .unwrap_or_else(|| TagRequirement::None);
 
+        let required_tags: Vec<String> = match obj.get("required_tags") {
+            None => Vec::new(),
+            Some(v) => {
+                let arr = v.as_array().ok_or_else(|| {
+                    "required_tags must be an array of strings".to_string()
+                })?;
+                let mut tags = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let s = item.as_str().ok_or_else(|| {
+                        "required_tags must be an array of strings".to_string()
+                    })?;
+                    tags.push(s.to_string());
+                }
+                tags
+            }
+        };
+
         Ok(KindFilterConfig {
             description,
             write,
@@ -517,6 +535,7 @@ impl KindFilterConfig {
             expiration,
             d_tag,
             p_tag,
+            required_tags,
         })
     }
 }

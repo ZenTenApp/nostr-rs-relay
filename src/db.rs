@@ -2,7 +2,9 @@
 use crate::config::Settings;
 use crate::error::{Error, Result};
 use crate::event::Event;
-use crate::kind_filters::{check_write_read_config, is_kind_allowed, validate_d_tag, validate_p_tag};
+use crate::kind_filters::{
+    check_write_read_config, is_kind_allowed, validate_d_tag, validate_p_tag, validate_required_tags,
+};
 use crate::nauthz;
 use crate::notice::Notice;
 use crate::payment::PaymentMessage;
@@ -489,6 +491,17 @@ pub async fn db_writer(
                 notice_tx
                     .try_send(Notice::blocked(event.id, "p tag requirement not met"))
                     .ok();
+                continue;
+            }
+
+            if let Err(msg) = validate_required_tags(&event, &filter_config.required_tags) {
+                debug!(
+                    "rejecting event: {} (kind: {}), {}",
+                    event.get_event_id_prefix(),
+                    event.kind,
+                    msg
+                );
+                notice_tx.try_send(Notice::blocked(event.id, &msg)).ok();
                 continue;
             }
 

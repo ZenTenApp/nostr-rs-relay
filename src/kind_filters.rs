@@ -78,6 +78,16 @@ pub fn validate_p_tag(event: &Event, requirement: &TagRequirement) -> bool {
     }
 }
 
+/// Validate that all required tag names are present on the event (any value)
+pub fn validate_required_tags(event: &Event, required_tags: &[String]) -> Result<(), String> {
+    for tag_name in required_tags {
+        if event.tag_values_by_name(tag_name).is_empty() {
+            return Err(format!("missing required tag: {}", tag_name));
+        }
+    }
+    Ok(())
+}
+
 /// Check if a kind is allowed based on whitelist/blacklist
 pub fn is_kind_allowed(kind: u64, filters: &KindFilters) -> bool {
     // If whitelist is present, only allow whitelisted kinds
