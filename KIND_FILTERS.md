@@ -82,24 +82,40 @@ The same format applies to `deny`. Deny rules take precedence over allow rules.
 
 1. Script execution (if present) - if script denies, access is denied
 2. Deny rule check - if denied, access is denied
-3. Allow rule check - if allowed, access is granted
+3. Allow rule check - explicit allow entries are granted first
+4. If `privileged: true` on read - AUTH'd author or AUTH'd `p`-tag users (see below)
+5. Otherwise access is denied
 
 ## Privileged Read Access
 
-When `privileged: true` is set in the `read` configuration, authenticated users can read events where their pubkey appears in the event's `p` tags, even if they're not explicitly in the `allow` list.
+When `privileged: true` is set in the `read` configuration, these authenticated clients can receive the event:
+
+1. An authenticated client whose pubkey is the **event author**
+2. An authenticated client whose pubkey appears in a **`p` tag**
+
+**`allow` takes precedence:** pubkeys listed in `allow` can also read, even if they are neither the author nor in a `p` tag.
+
+`"allow": "*"` (the default when `allow` is omitted) does **not** override `privileged` — otherwise privileged would be useless. Use an explicit pubkey list to grant extra readers.
+
+Everyone else is denied, including unauthenticated clients (unless granted via an explicit `allow` list match). NIP-42 auth must be enabled for author/`p`-tag access:
+
+```toml
+[authorization]
+nip42_auth = true
+```
 
 This is useful for:
 
-- **Direct Messages (kind 4, 44, 1059)** - Recipients can read messages addressed to them
-- **Mentions** - Users can read notes that mention them
-- **Custom event types** - Any event where the user is a participant (listed in `p` tags)
+- **Direct Messages / private kinds** - Author and addressed parties only
+- **Mentions** - Author and users listed in `p` tags
+- **Custom event types** - Any event where access should be limited to participants, plus optional allowlisted readers
 
 ```json
 {
   "4": {
     "description": "Direct messages",
     "read": {
-      "allow": ["sender_pubkey"],
+      "allow": ["moderator_pubkey_hex"],
       "privileged": true
     }
   }
@@ -108,8 +124,9 @@ This is useful for:
 
 In this example:
 
-- The sender (in `allow` list) can read
-- Any authenticated user whose pubkey is in the event's `p` tags can also read
+- Authenticated author can read
+- Authenticated users listed in `p` tags can read
+- Users in `allow` can read (even if not author/`p`-tagged)
 - All other users are denied
 
 ## Per-Kind Configuration

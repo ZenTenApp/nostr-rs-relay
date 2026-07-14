@@ -305,7 +305,7 @@ pub struct WriteReadConfig {
     pub script: Option<String>,        // Path to executable script
     pub allow: AccessRule,            // Allow rule (defaults to All)
     pub deny: AccessRule,              // Deny rule (defaults to None)
-    pub privileged: bool,             // If true, allows parties_involved for read
+    pub privileged: bool, // If true on read: AUTH'd author + p-tagged; allow list takes precedence
 }
 
 /// Per-kind filter configuration

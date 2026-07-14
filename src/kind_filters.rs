@@ -150,34 +150,35 @@ pub fn execute_script(
     Ok(output.status.success())
 }
 
-/// Check if an access rule allows the event, with privileged support
+/// Check if an access rule allows the event
 pub fn check_access_rule(
     rule: &AccessRule,
     event: &Event,
     auth_pubkey: Option<&str>,
     server_pubkey: Option<&str>,
-    privileged: bool,
 ) -> bool {
     match rule {
         AccessRule::All => true,
         AccessRule::None => false,
-        AccessRule::List(identifiers) => {
-            // Check if any identifier matches
-            let identifier_match = identifiers
-                .iter()
-                .any(|id| evaluate_access_identifier(id, event, auth_pubkey, server_pubkey));
-            
-            // If privileged is true, also check if auth_pubkey is in event's "p" tags
-            if privileged && !identifier_match {
-                if let Some(auth_pk) = auth_pubkey {
-                    let p_tags = event.tag_values_by_name("p");
-                    return p_tags.contains(&auth_pk.to_string());
-                }
-            }
-            
-            identifier_match
-        }
+        AccessRule::List(identifiers) => identifiers
+            .iter()
+            .any(|id| evaluate_access_identifier(id, event, auth_pubkey, server_pubkey)),
     }
+}
+
+/// Privileged read: NIP-42 AUTH required, and auth pubkey must be the
+/// event author or listed in a "p" tag. Nobody else may read.
+pub fn check_privileged_read(event: &Event, auth_pubkey: Option<&str>) -> bool {
+    let Some(auth_pk) = auth_pubkey else {
+        return false;
+    };
+    if event.pubkey == auth_pk {
+        return true;
+    }
+    event
+        .tag_values_by_name("p")
+        .iter()
+        .any(|p| p == auth_pk)
 }
 
 /// Check if a write/read config allows the event
@@ -205,26 +206,192 @@ pub fn check_write_read_config(
         }
     }
 
-    // Check deny rule first (deny takes precedence over allow)
-    let denied = check_access_rule(
-        &config.deny,
-        event,
-        auth_pubkey,
-        server_pubkey,
-        false, // deny doesn't use privileged
-    );
+    // Check deny rule first (deny takes precedence over allow/privileged)
+    let denied = check_access_rule(&config.deny, event, auth_pubkey, server_pubkey);
     if denied {
         return false;
     }
 
-    // Check allow rule with privileged support for read operations
-    let privileged = is_read && config.privileged;
-    check_access_rule(
-        &config.allow,
-        event,
-        auth_pubkey,
-        server_pubkey,
-        privileged,
-    )
+    let allowed = check_access_rule(&config.allow, event, auth_pubkey, server_pubkey);
+
+    // Privileged read: AUTH'd author or AUTH'd p-tag may read.
+    // Explicit allow entries take precedence (extra readers).
+    // AccessRule::All does not short-circuit privileged — otherwise the
+    // default allow:"*" would make privileged useless.
+    if is_read && config.privileged {
+        if !matches!(config.allow, AccessRule::All) && allowed {
+            return true;
+        }
+        return check_privileged_read(event, auth_pubkey);
+    }
+
+    allowed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AccessRule, WriteReadConfig};
+    use crate::event::Event;
+
+    fn test_event(author: &str, p_tags: &[&str]) -> Event {
+        Event {
+            id: "0".repeat(64),
+            pubkey: author.to_string(),
+            delegated_by: None,
+            created_at: 0,
+            kind: 4,
+            tags: p_tags
+                .iter()
+                .map(|p| vec!["p".to_string(), p.to_string()])
+                .collect(),
+            content: String::new(),
+            sig: String::new(),
+            tagidx: None,
+        }
+    }
+
+    fn privileged_read_config() -> WriteReadConfig {
+        WriteReadConfig {
+            script: None,
+            allow: AccessRule::All, // does not short-circuit privileged
+            deny: AccessRule::None,
+            privileged: true,
+        }
+    }
+
+    #[test]
+    fn privileged_requires_auth() {
+        let author = "a".repeat(64);
+        let recipient = "b".repeat(64);
+        let event = test_event(&author, &[&recipient]);
+        let config = privileged_read_config();
+
+        assert!(!check_write_read_config(
+            &config, &event, None, None, true
+        ));
+    }
+
+    #[test]
+    fn privileged_allows_authenticated_author() {
+        let author = "a".repeat(64);
+        let recipient = "b".repeat(64);
+        let event = test_event(&author, &[&recipient]);
+        let config = privileged_read_config();
+
+        assert!(check_write_read_config(
+            &config,
+            &event,
+            Some(&author),
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn privileged_allows_authenticated_p_tag() {
+        let author = "a".repeat(64);
+        let recipient = "b".repeat(64);
+        let event = test_event(&author, &[&recipient]);
+        let config = privileged_read_config();
+
+        assert!(check_write_read_config(
+            &config,
+            &event,
+            Some(&recipient),
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn privileged_denies_unrelated_authenticated_user() {
+        let author = "a".repeat(64);
+        let recipient = "b".repeat(64);
+        let stranger = "c".repeat(64);
+        let event = test_event(&author, &[&recipient]);
+        let config = privileged_read_config();
+
+        assert!(!check_write_read_config(
+            &config,
+            &event,
+            Some(&stranger),
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn allow_takes_precedence_over_privileged() {
+        let author = "a".repeat(64);
+        let recipient = "b".repeat(64);
+        let allowed_extra = "d".repeat(64);
+        let event = test_event(&author, &[&recipient]);
+        let config = WriteReadConfig {
+            script: None,
+            allow: AccessRule::List(vec![allowed_extra.clone()]),
+            deny: AccessRule::None,
+            privileged: true,
+        };
+
+        // Allowlisted pubkey (neither author nor p-tagged) can read
+        assert!(check_write_read_config(
+            &config,
+            &event,
+            Some(&allowed_extra),
+            None,
+            true
+        ));
+        // Author still via privileged
+        assert!(check_write_read_config(
+            &config,
+            &event,
+            Some(&author),
+            None,
+            true
+        ));
+        // Unrelated still denied
+        let stranger = "c".repeat(64);
+        assert!(!check_write_read_config(
+            &config,
+            &event,
+            Some(&stranger),
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn privileged_ignored_on_write() {
+        let author = "a".repeat(64);
+        let event = test_event(&author, &[]);
+        let config = privileged_read_config();
+
+        // On write, privileged is ignored and allow:* permits everyone
+        assert!(check_write_read_config(
+            &config, &event, None, None, false
+        ));
+    }
+
+    #[test]
+    fn privileged_deny_still_applies() {
+        let author = "a".repeat(64);
+        let recipient = "b".repeat(64);
+        let event = test_event(&author, &[&recipient]);
+        let config = WriteReadConfig {
+            script: None,
+            allow: AccessRule::All,
+            deny: AccessRule::List(vec![recipient.clone()]),
+            privileged: true,
+        };
+
+        assert!(!check_write_read_config(
+            &config,
+            &event,
+            Some(&recipient),
+            None,
+            true
+        ));
+    }
 }
 
