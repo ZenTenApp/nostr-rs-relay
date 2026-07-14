@@ -317,6 +317,7 @@ pub struct KindFilterConfig {
     pub max_size: Option<usize>,
     pub rate_limit: Option<RateLimitConfig>,
     pub expiration: ExpirationConfig,
+    pub max_expiration: ExpirationConfig,
     pub d_tag: TagRequirement,
     pub p_tag: TagRequirement,
     pub required_tags: Vec<String>,
@@ -497,6 +498,12 @@ impl KindFilterConfig {
             .map(|s| ExpirationConfig::from_str(s))
             .unwrap_or_else(|| ExpirationConfig::from_str("never"));
 
+        let max_expiration: ExpirationConfig = obj
+            .get("max_expiration")
+            .and_then(|v| v.as_str())
+            .map(|s| ExpirationConfig::from_str(s))
+            .unwrap_or_else(|| ExpirationConfig::from_str("never"));
+
         let d_tag: TagRequirement = obj
             .get("d_tag")
             .and_then(|v| v.as_str())
@@ -533,6 +540,7 @@ impl KindFilterConfig {
             max_size,
             rate_limit,
             expiration,
+            max_expiration,
             d_tag,
             p_tag,
             required_tags,

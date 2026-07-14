@@ -523,6 +523,32 @@ pub async fn db_writer(
                 }
             }
 
+            // Check max_expiration: reject if the event's NIP-40 expiration tag is set
+            // further in the future than the configured maximum allowed window.
+            // Events with no expiration tag are not affected.
+            if let Some(max_exp_duration) = filter_config.max_expiration.duration {
+                if let Some(event_exp) = event.expiration() {
+                    let now = crate::utils::unix_time();
+                    let max_allowed = now + max_exp_duration.as_secs();
+                    if event_exp > max_allowed {
+                        debug!(
+                            "rejecting event: {} (kind: {}), expiration tag too far in the future (exp={}, max_allowed={})",
+                            event.get_event_id_prefix(),
+                            event.kind,
+                            event_exp,
+                            max_allowed
+                        );
+                        notice_tx
+                            .try_send(Notice::blocked(
+                                event.id,
+                                "expiration tag exceeds maximum allowed duration",
+                            ))
+                            .ok();
+                        continue;
+                    }
+                }
+            }
+
             // Check per-kind rate limit
             if let Some(rate_limiter) = kind_rate_limiters.get(&event.kind) {
                 if rate_limiter.check().is_err() {

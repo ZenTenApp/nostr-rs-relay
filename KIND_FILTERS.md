@@ -138,7 +138,8 @@ Each kind number (as a string) can have its own configuration section:
 - **`write`** (optional) - Write access configuration
 - **`read`** (optional) - Read access configuration
 - **`max_size`** (optional) - Maximum event size (see Max Size section)
-- **`expiration`** (optional) - Event expiration time (see Expiration section)
+- **`expiration`** (optional) - Server-side TTL; rejects events already past this age (see Expiration section)
+- **`max_expiration`** (optional) - Maximum allowed NIP-40 expiration window; rejects events whose `expiration` tag is set too far in the future (see Max Expiration section)
 - **`rate_limit`** (optional) - Rate limiting (see Rate Limiting section)
 - **`d_tag`** (optional) - Requirement for `d` tag (see Tag Requirements section)
 - **`p_tag`** (optional) - Requirement for `p` tag (see Tag Requirements section)
@@ -166,6 +167,37 @@ Examples:
   }
 }
 ```
+
+## Max Expiration
+
+Limit how far in the future a client is allowed to set the NIP-40 `expiration` tag on an incoming event. If the event's `expiration` tag value is further in the future than `now + max_expiration`, the event is **rejected at publish time**.
+
+This is useful for preventing clients from publishing events that would be stored indefinitely (or for an unreasonably long time) by setting a very far-future expiration.
+
+**Format:** Duration string or `"never"` (default — no limit enforced)
+
+**Important notes:**
+
+- This is **optional**. If absent or set to `"never"`, no limit is enforced.
+- Only events that **have** a NIP-40 `expiration` tag are checked. Events with no expiration tag are **not** affected.
+- Uses the same duration string format as `expiration`.
+
+Examples:
+
+- `"never"` - No limit (default)
+- `"30d"` - Reject events whose expiration tag is more than 30 days from now
+- `"7d"` - Reject events whose expiration tag is more than 7 days from now
+- `"1h"` - Reject events whose expiration tag is more than 1 hour from now
+
+```json
+{
+  "1": {
+    "max_expiration": "30d"
+  }
+}
+```
+
+Rejection notice sent to client: `expiration tag exceeds maximum allowed duration`
 
 ## Max Size
 
