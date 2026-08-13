@@ -4,6 +4,7 @@ use crate::event::Event;
 use log::debug;
 use std::process::{Command, Stdio};
 use std::io::Write;
+use std::time::Duration;
 
 /// Evaluate a special access identifier
 pub fn evaluate_access_identifier(
@@ -84,6 +85,34 @@ pub fn validate_required_tags(event: &Event, required_tags: &[String]) -> Result
         if event.tag_values_by_name(tag_name).is_empty() {
             return Err(format!("missing required tag: {}", tag_name));
         }
+    }
+    Ok(())
+}
+
+/// Validate the NIP-40 `expiration` tag against a maximum allowed window.
+///
+/// - If no `expiration` tag is present, this returns Ok (presence is normally
+///   enforced separately via `required_tags`).
+/// - If an `expiration` tag is present but its value is not a valid unsigned
+///   integer timestamp, this returns an error (closes the bypass where a
+///   non-numeric value would otherwise skipped the max window check).
+/// - If the value parses but is further in the future than `now + max_duration`,
+///   this returns an error.
+pub fn validate_expiration_window(event: &Event, max_duration: Duration) -> Result<(), String> {
+    let has_expiration_tag = event
+        .tags
+        .iter()
+        .any(|t| t.first().map(|s| s.as_str()) == Some("expiration"));
+    if !has_expiration_tag {
+        return Ok(());
+    }
+    let Some(event_exp) = event.expiration() else {
+        return Err("invalid expiration tag".to_string());
+    };
+    let now = crate::utils::unix_time();
+    let max_allowed = now + max_duration.as_secs();
+    if event_exp > max_allowed {
+        return Err("expiration tag exceeds maximum allowed duration".to_string());
     }
     Ok(())
 }
@@ -233,6 +262,7 @@ mod tests {
     use super::*;
     use crate::config::{AccessRule, WriteReadConfig};
     use crate::event::Event;
+    use std::time::Duration;
 
     fn test_event(author: &str, p_tags: &[&str]) -> Event {
         Event {
@@ -371,6 +401,33 @@ mod tests {
         assert!(check_write_read_config(
             &config, &event, None, None, false
         ));
+    }
+
+    #[test]
+    fn expiration_window_rejects_unparseable_tag() {
+        let author = "a".repeat(64);
+        let mut event = test_event(&author, &[]);
+        event.tags = vec![vec!["expiration".to_string(), "garbage".to_string()]];
+        let err = validate_expiration_window(&event, Duration::from_secs(75 * 3600));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn expiration_window_ok_within_limit() {
+        let author = "a".repeat(64);
+        let now = crate::utils::unix_time();
+        let mut event = test_event(&author, &[]);
+        event.tags = vec![vec!["expiration".to_string(), (now + 3600).to_string()]];
+        assert_eq!(validate_expiration_window(&event, Duration::from_secs(75 * 3600)), Ok(()));
+    }
+
+    #[test]
+    fn expiration_window_rejects_far_future() {
+        let author = "a".repeat(64);
+        let now = crate::utils::unix_time();
+        let mut event = test_event(&author, &[]);
+        event.tags = vec![vec!["expiration".to_string(), (now + 100 * 3600).to_string()]];
+        assert!(validate_expiration_window(&event, Duration::from_secs(75 * 3600)).is_err());
     }
 
     #[test]

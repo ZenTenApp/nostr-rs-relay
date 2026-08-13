@@ -1,9 +1,10 @@
 //! Event persistence and querying
-use crate::config::Settings;
+use crate::config::{RateScope, Settings};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::kind_filters::{
-    check_write_read_config, is_kind_allowed, validate_d_tag, validate_p_tag, validate_required_tags,
+    check_write_read_config, is_kind_allowed, validate_d_tag, validate_expiration_window,
+    validate_p_tag, validate_required_tags,
 };
 use crate::nauthz;
 use crate::notice::Notice;
@@ -21,8 +22,8 @@ use r2d2;
 use sqlx::pool::PoolOptions;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::ConnectOptions;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -102,6 +103,51 @@ async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> Post
     repo
 }
 
+/// A simple sliding-window rate limiter keyed by arbitrary string
+/// (npub, IP, or "" for a global bucket).
+struct SlidingWindowLimiter {
+    window_secs: u64,
+    max_events: u32,
+    buckets: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl SlidingWindowLimiter {
+    fn new(window_secs: u64, max_events: u32) -> Self {
+        SlidingWindowLimiter {
+            window_secs,
+            max_events,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attempt to record an event under `key`. Returns true if within limit.
+    fn check(&self, key: &str) -> bool {
+        let mut buckets = self.buckets.lock().unwrap();
+        let now = Instant::now();
+        let window = Duration::from_secs(self.window_secs);
+        let q = buckets.entry(key.to_string()).or_default();
+        while q
+            .front()
+            .map(|t| now.duration_since(*t) >= window)
+            .unwrap_or(false)
+        {
+            q.pop_front();
+        }
+        if (q.len() as u32) < self.max_events {
+            q.push_back(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A configured rate-limit rule bound to its limiter, for a specific kind.
+struct BoundRateRule {
+    scope: RateScope,
+    limiter: SlidingWindowLimiter,
+}
+
 /// Spawn a database writer that persists events to the `SQLite` store.
 pub async fn db_writer(
     repo: Arc<dyn NostrRepo>,
@@ -149,6 +195,23 @@ pub async fn db_writer(
             info!(
                 "Enabling per-kind rate limit for kind {}: {}/min",
                 kind, rate_limit.events_per_minute
+            );
+        }
+    }
+
+    // Build keyed sliding-window rate limiters (per 1h/1d, per npub/ip) from
+    // the richer `rate_limits` rules.
+    let mut kind_sliding_limiters: HashMap<u64, Vec<BoundRateRule>> = HashMap::new();
+    for (kind, filter_config) in &settings.kind_filters.filters {
+        for rule in &filter_config.rate_limits {
+            let bound = BoundRateRule {
+                scope: rule.scope,
+                limiter: SlidingWindowLimiter::new(rule.window.as_secs(), rule.limit),
+            };
+            kind_sliding_limiters.entry(*kind).or_default().push(bound);
+            info!(
+                "Enabling per-kind sliding rate limit for kind {}: {}/{}sec keyed by {:?}",
+                kind, rule.limit, rule.window.as_secs(), rule.scope
             );
         }
     }
@@ -448,6 +511,19 @@ pub async fn db_writer(
                 }
             }
 
+            // Require NIP-42 authentication for publishing this kind
+            if filter_config.require_auth && auth_pubkey_str.is_none() {
+                debug!(
+                    "rejecting event: {} (kind: {}), authentication required",
+                    event.get_event_id_prefix(),
+                    event.kind
+                );
+                notice_tx
+                    .try_send(Notice::blocked(event.id, "authentication required to publish this kind"))
+                    .ok();
+                continue;
+            }
+
             // Check size limit
             if let Some(max_size) = filter_config.max_size {
                 let event_json = serde_json::to_string(&event).unwrap_or_default();
@@ -505,6 +581,42 @@ pub async fn db_writer(
                 continue;
             }
 
+            // Check tag size restrictions
+            if let Some(tl) = filter_config.tag_limits {
+                let mut tag_err: Option<String> = None;
+                if tl.max_tags > 0 && event.tags.len() > tl.max_tags {
+                    tag_err = Some(format!("too many tags: {} > {}", event.tags.len(), tl.max_tags));
+                } else {
+                    for tag in &event.tags {
+                        if let Some(name) = tag.first() {
+                            if tl.max_tag_name_chars > 0 && name.chars().count() > tl.max_tag_name_chars {
+                                tag_err = Some(format!("tag name exceeds {} chars", tl.max_tag_name_chars));
+                                break;
+                            }
+                        }
+                        for val in tag.iter().skip(1) {
+                            if tl.max_tag_value_chars > 0 && val.chars().count() > tl.max_tag_value_chars {
+                                tag_err = Some(format!("tag value exceeds {} chars", tl.max_tag_value_chars));
+                                break;
+                            }
+                        }
+                        if tag_err.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if let Some(msg) = tag_err {
+                    debug!(
+                        "rejecting event: {} (kind: {}), {}",
+                        event.get_event_id_prefix(),
+                        event.kind,
+                        msg
+                    );
+                    notice_tx.try_send(Notice::blocked(event.id, &msg)).ok();
+                    continue;
+                }
+            }
+
             // Check expiration
             if let Some(expiration_duration) = filter_config.expiration.duration {
                 // Check if event has expired based on created_at + expiration duration
@@ -524,36 +636,53 @@ pub async fn db_writer(
             }
 
             // Check max_expiration: reject if the event's NIP-40 expiration tag is set
-            // further in the future than the configured maximum allowed window.
-            // Events with no expiration tag are not affected.
+            // further in the future than the configured maximum allowed window, or is
+            // present but not a valid numeric timestamp.
             if let Some(max_exp_duration) = filter_config.max_expiration.duration {
-                if let Some(event_exp) = event.expiration() {
-                    let now = crate::utils::unix_time();
-                    let max_allowed = now + max_exp_duration.as_secs();
-                    if event_exp > max_allowed {
-                        debug!(
-                            "rejecting event: {} (kind: {}), expiration tag too far in the future (exp={}, max_allowed={})",
-                            event.get_event_id_prefix(),
-                            event.kind,
-                            event_exp,
-                            max_allowed
-                        );
-                        notice_tx
-                            .try_send(Notice::blocked(
-                                event.id,
-                                "expiration tag exceeds maximum allowed duration",
-                            ))
-                            .ok();
-                        continue;
-                    }
+                if let Err(msg) = validate_expiration_window(&event, max_exp_duration) {
+                    debug!(
+                        "rejecting event: {} (kind: {}), {}",
+                        event.get_event_id_prefix(),
+                        event.kind,
+                        msg
+                    );
+                    notice_tx.try_send(Notice::blocked(event.id, &msg)).ok();
+                    continue;
                 }
             }
 
-            // Check per-kind rate limit
+            // Check per-kind rate limit (legacy global per-minute)
             if let Some(rate_limiter) = kind_rate_limiters.get(&event.kind) {
                 if rate_limiter.check().is_err() {
                     debug!(
                         "rejecting event: {} (kind: {}), rate limit exceeded",
+                        event.get_event_id_prefix(),
+                        event.kind
+                    );
+                    notice_tx
+                        .try_send(Notice::blocked(event.id, "rate limit exceeded for this kind"))
+                        .ok();
+                    continue;
+                }
+            }
+
+            // Check keyed sliding-window rate limits (per 1h/1d, per npub/ip)
+            if let Some(bound_rules) = kind_sliding_limiters.get(&event.kind) {
+                let mut exceeded = false;
+                for rule in bound_rules {
+                    let key = match rule.scope {
+                        RateScope::Global => String::new(),
+                        RateScope::Npub => event.pubkey.clone(),
+                        RateScope::Ip => subm_event.source_ip.clone(),
+                    };
+                    if !rule.limiter.check(&key) {
+                        exceeded = true;
+                        break;
+                    }
+                }
+                if exceeded {
+                    debug!(
+                        "rejecting event: {} (kind: {}), sliding rate limit exceeded",
                         event.get_event_id_prefix(),
                         event.kind
                     );
@@ -662,4 +791,45 @@ pub struct QueryResult {
     pub sub_id: String,
     /// Serialized event
     pub event: String,
+}
+
+#[cfg(test)]
+mod kind_rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn sliding_window_allows_up_to_limit() {
+        let lim = SlidingWindowLimiter::new(3600, 3);
+        assert!(lim.check("npub1"));
+        assert!(lim.check("npub1"));
+        assert!(lim.check("npub1"));
+        assert!(!lim.check("npub1")); // over limit
+    }
+
+    #[test]
+    fn sliding_window_keys_are_independent() {
+        let lim = SlidingWindowLimiter::new(3600, 2);
+        assert!(lim.check("alice"));
+        assert!(lim.check("alice"));
+        assert!(!lim.check("alice"));
+        assert!(lim.check("bob")); // different key unaffected
+    }
+
+    #[test]
+    fn sliding_window_global_key_shares_bucket() {
+        let lim = SlidingWindowLimiter::new(60, 2);
+        assert!(lim.check(""));
+        assert!(lim.check(""));
+        assert!(!lim.check(""));
+    }
+
+    #[test]
+    fn sliding_window_resets_after_window() {
+        let lim = SlidingWindowLimiter::new(1, 2); // 1 second window
+        assert!(lim.check("k"));
+        assert!(lim.check("k"));
+        assert!(!lim.check("k"));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(lim.check("k")); // window expired
+    }
 }

@@ -1073,6 +1073,11 @@ fn allowed_to_send(event_str: &str, conn: &conn::ClientConn, settings: &Settings
         let auth_pubkey_str = conn.auth_pubkey().map(|s| s.as_str());
         let server_pubkey = settings.info.pubkey.as_deref();
 
+        // Require NIP-42 authentication to read this kind
+        if filter_config.require_auth && auth_pubkey_str.is_none() {
+            return false;
+        }
+
         // Check read access using new structure
         if let Some(ref read_config) = filter_config.read {
             let read_allowed = crate::kind_filters::check_write_read_config(

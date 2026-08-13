@@ -158,6 +158,9 @@ Each kind number (as a string) can have its own configuration section:
 - **`expiration`** (optional) - Server-side TTL; rejects events already past this age (see Expiration section)
 - **`max_expiration`** (optional) - Maximum allowed NIP-40 expiration window; rejects events whose `expiration` tag is set too far in the future (see Max Expiration section)
 - **`rate_limit`** (optional) - Rate limiting (see Rate Limiting section)
+- **`require_auth`** (optional) - If `true`, NIP-42 authentication is required to publish (see Authenticated Writes section)
+- **`rate_limits`** (optional) - List of keyed rate-limit rules per window/scope (see Keyed Rate Limiting section)
+- **`tag_limits`** (optional) - Per-kind tag size restrictions (see Tag Restrictions section)
 - **`d_tag`** (optional) - Requirement for `d` tag (see Tag Requirements section)
 - **`p_tag`** (optional) - Requirement for `p` tag (see Tag Requirements section)
 - **`required_tags`** (optional) - List of tag names that must be present (see Tag Requirements section)
@@ -197,6 +200,7 @@ This is useful for preventing clients from publishing events that would be store
 
 - This is **optional**. If absent or set to `"never"`, no limit is enforced.
 - Only events that **have** a NIP-40 `expiration` tag are checked. Events with no expiration tag are **not** affected.
+- If an `expiration` tag is present but its value is not a valid numeric timestamp, the event is rejected (`invalid expiration tag`). This prevents bypassing the window cap with a non-numeric value.
 - Uses the same duration string format as `expiration`.
 
 Examples:
@@ -274,6 +278,81 @@ Examples:
 {
   "1": {
     "rate_limit": "10/min"
+  }
+}
+
+## Keyed Rate Limiting
+
+Enforce multiple rate-limit rules per kind, with sliding windows and
+per-key buckets. This is the richer rule format supporting hourly,
+daily, per-pubkey, and per-IP limits simultaneously.
+
+**Format:** array of rule objects:
+
+- **`limit`** (required) - Maximum events allowed in the window
+- **`window`** (required) - `"1m"` (minute), `"1h"` (hour), or `"1d"` (day)
+- **`scope`** (required) - `"global"` (shared bucket for the kind),
+  `"npub"` (keyed by event author pubkey), or `"ip"` (keyed by client IP)
+
+Every configured rule must pass; if any rule is exceeded, the event is
+rejected. Each rule is an independent sliding-window counter.
+
+```json
+{
+  "4": {
+    "rate_limits": [
+      { "limit": 300,  "window": "1h", "scope": "npub" },
+      { "limit": 1000, "window": "1d", "scope": "npub" },
+      { "limit": 900,  "window": "1h", "scope": "ip" },
+      { "limit": 2500, "window": "1d", "scope": "ip" }
+    ]
+  }
+}
+```
+
+## Authenticated Writes
+
+Require NIP-42 authentication before a client may publish events of a
+kind. Set `require_auth: true` on the kind:
+
+```json
+{
+  "4": {
+    "require_auth": true
+  }
+}
+```
+
+When enabled, unauthenticated clients are rejected at publish time with
+`authentication required to publish this kind`. Reads are also denied to
+unauthenticated clients when `require_auth` is set. NIP-42 auth must be
+enabled globally for this to work:
+
+```toml
+[authorization]
+nip42_auth = true
+```
+
+## Tag Restrictions
+
+Limit the number of tags and the size of tag names/values for a kind.
+A value of `0` disables that dimension. This also caps the size of the
+required `expiration` and `client` tags.
+
+**Fields:**
+
+- **`max_tags`** - Maximum number of tags on the event
+- **`max_tag_name_chars`** - Max characters in each tag name (e.g. `p`)
+- **`max_tag_value_chars`** - Max characters in each tag value
+
+```json
+{
+  "4": {
+    "tag_limits": {
+      "max_tags": 32,
+      "max_tag_name_chars": 32,
+      "max_tag_value_chars": 128
+    }
   }
 }
 ```

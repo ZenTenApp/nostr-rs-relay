@@ -48,6 +48,40 @@ pub fn start_relay() -> Result<Relay> {
     })
 }
 
+/// Start a relay with a caller-supplied (already customised) settings.
+pub fn start_relay_with_settings(mut settings: config::Settings) -> Result<Relay> {
+    // setup tracing
+    let _trace_sub = tracing_subscriber::fmt::try_init();
+    info!("Starting a new relay");
+    // identify open port
+    info!("Checking for address...");
+    let port = get_available_port().unwrap();
+    info!("Found open port: {}", port);
+    // bind to local interface only
+    settings.network.address = "127.0.0.1".to_owned();
+    settings.network.port = port;
+    // create an in-memory DB with multiple readers
+    settings.database.in_memory = true;
+    settings.database.min_conn = 4;
+    settings.database.max_conn = 8;
+    // enable NIP-42 auth so require_auth / privileged reads work
+    settings.authorization.nip42_auth = true;
+    // NIP-42 auth events must validate against a relay URL
+    if settings.info.relay_url.is_none() {
+        settings.info.relay_url = Some("wss://nostr.example.com/".to_owned());
+    }
+    let (shutdown_tx, shutdown_rx): (MpscSender<()>, MpscReceiver<()>) = syncmpsc::channel();
+    let handle = thread::spawn(move || {
+        // server will block the thread it is run on.
+        let _ = start_server(&settings, shutdown_rx);
+    });
+    Ok(Relay {
+        port,
+        handle,
+        shutdown_tx,
+    })
+}
+
 // check if the server is healthy via HTTP request
 async fn server_ready(relay: &Relay) -> Result<bool> {
     let uri: String = format!("http://127.0.0.1:{}/", relay.port);

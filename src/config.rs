@@ -299,6 +299,116 @@ impl ExpirationConfig {
     }
 }
 
+/// Rate limit window
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateWindow {
+    Minute,
+    Hour,
+    Day,
+}
+
+impl RateWindow {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "min" | "minute" | "1m" => Some(RateWindow::Minute),
+            "hour" | "h" | "1h" => Some(RateWindow::Hour),
+            "day" | "d" | "1d" => Some(RateWindow::Day),
+            _ => None,
+        }
+    }
+
+    pub fn as_secs(&self) -> u64 {
+        match self {
+            RateWindow::Minute => 60,
+            RateWindow::Hour => 3600,
+            RateWindow::Day => 86400,
+        }
+    }
+}
+
+/// Rate limit scope: what the bucket is keyed by
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateScope {
+    /// Shared bucket across all writers of this kind
+    Global,
+    /// Keyed by event author (npub / pubkey)
+    Npub,
+    /// Keyed by client IP
+    Ip,
+}
+
+impl RateScope {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "global" | "any" | "server" => Some(RateScope::Global),
+            "npub" | "pubkey" | "author" => Some(RateScope::Npub),
+            "ip" | "remote_ip" => Some(RateScope::Ip),
+            _ => None,
+        }
+    }
+}
+
+/// A single rate-limit rule: at most `limit` events per `window`, keyed by `scope`.
+#[derive(Debug, Clone)]
+pub struct RateLimitRule {
+    pub limit: u32,
+    pub window: RateWindow,
+    pub scope: RateScope,
+}
+
+impl RateLimitRule {
+    pub fn from_json_value(value: &serde_json::Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        let limit = obj.get("limit")?.as_u64()? as u32;
+        let window = obj
+            .get("window")?
+            .as_str()
+            .and_then(RateWindow::from_str)?;
+        let scope = obj
+            .get("scope")?
+            .as_str()
+            .and_then(RateScope::from_str)?;
+        Some(RateLimitRule {
+            limit,
+            window,
+            scope,
+        })
+    }
+}
+
+/// Per-kind tag size restrictions.
+/// A value of 0 for any field means "no limit" for that dimension.
+#[derive(Debug, Clone, Copy)]
+pub struct TagLimits {
+    /// Max number of tags on the event
+    pub max_tags: usize,
+    /// Max length (in chars) of each tag name
+    pub max_tag_name_chars: usize,
+    /// Max length (in chars) of each tag value
+    pub max_tag_value_chars: usize,
+}
+
+impl TagLimits {
+    pub fn from_json_value(value: &serde_json::Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        let get_usize = |key: &str, default: usize| {
+            obj.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(default)
+        };
+        Some(TagLimits {
+            max_tags: get_usize("max_tags", 0),
+            max_tag_name_chars: get_usize("max_tag_name_chars", 0),
+            max_tag_value_chars: get_usize("max_tag_value_chars", 0),
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.max_tags > 0 || self.max_tag_name_chars > 0 || self.max_tag_value_chars > 0
+    }
+}
+
 /// Write/read configuration for a kind
 #[derive(Debug, Clone)]
 pub struct WriteReadConfig {
@@ -316,6 +426,9 @@ pub struct KindFilterConfig {
     pub read: Option<WriteReadConfig>,
     pub max_size: Option<usize>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub require_auth: bool,
+    pub rate_limits: Vec<RateLimitRule>,
+    pub tag_limits: Option<TagLimits>,
     pub expiration: ExpirationConfig,
     pub max_expiration: ExpirationConfig,
     pub d_tag: TagRequirement,
@@ -533,12 +646,33 @@ impl KindFilterConfig {
             }
         };
 
+        let require_auth = obj
+            .get("require_auth")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let rate_limits: Vec<RateLimitRule> = match obj.get("rate_limits") {
+            None => Vec::new(),
+            Some(v) => {
+                if let Some(arr) = v.as_array() {
+                    arr.iter().filter_map(RateLimitRule::from_json_value).collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+
+        let tag_limits = obj.get("tag_limits").and_then(TagLimits::from_json_value);
+
         Ok(KindFilterConfig {
             description,
             write,
             read,
             max_size,
             rate_limit,
+            require_auth,
+            rate_limits,
+            tag_limits,
             expiration,
             max_expiration,
             d_tag,
@@ -825,5 +959,71 @@ impl Default for Settings {
                 config_file: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_kind_config_with_new_fields() {
+        let json = serde_json::json!({
+            "description": "DM test",
+            "write": {"allow": "*"},
+            "read": {"allow": "*", "privileged": true},
+            "require_auth": true,
+            "max_size": "4KB",
+            "max_expiration": "75h",
+            "p_tag": "hex",
+            "required_tags": ["expiration", "client"],
+            "rate_limits": [
+                {"limit": 300, "window": "1h", "scope": "npub"},
+                {"limit": 1000, "window": "1d", "scope": "ip"},
+                {"limit": 5, "window": "1m", "scope": "global"}
+            ],
+            "tag_limits": {
+                "max_tags": 32,
+                "max_tag_name_chars": 16,
+                "max_tag_value_chars": 128
+            }
+        });
+        let cfg = KindFilterConfig::from_json_value(&json).unwrap();
+        assert!(cfg.require_auth);
+        assert_eq!(cfg.max_size, Some(4 * 1024));
+        assert_eq!(
+            cfg.max_expiration.duration.map(|d| d.as_secs()),
+            Some(75 * 3600)
+        );
+        assert_eq!(cfg.p_tag, TagRequirement::RequiredHex);
+        assert_eq!(cfg.required_tags, vec!["expiration", "client"]);
+
+        assert_eq!(cfg.rate_limits.len(), 3);
+        assert_eq!(cfg.rate_limits[0].limit, 300);
+        assert_eq!(cfg.rate_limits[0].window, RateWindow::Hour);
+        assert_eq!(cfg.rate_limits[0].scope, RateScope::Npub);
+        assert_eq!(cfg.rate_limits[1].window, RateWindow::Day);
+        assert_eq!(cfg.rate_limits[1].scope, RateScope::Ip);
+        assert_eq!(cfg.rate_limits[2].window, RateWindow::Minute);
+        assert_eq!(cfg.rate_limits[2].scope, RateScope::Global);
+
+        let tl = cfg.tag_limits.unwrap();
+        assert_eq!(tl.max_tags, 32);
+        assert_eq!(tl.max_tag_name_chars, 16);
+        assert_eq!(tl.max_tag_value_chars, 128);
+        assert!(tl.enabled());
+    }
+
+    #[test]
+    fn rate_windows_parse() {
+        assert_eq!(RateWindow::from_str("1h"), Some(RateWindow::Hour));
+        assert_eq!(RateWindow::from_str("H"), Some(RateWindow::Hour));
+        assert_eq!(RateWindow::from_str("1d"), Some(RateWindow::Day));
+        assert_eq!(RateWindow::from_str("DAY"), Some(RateWindow::Day));
+        assert_eq!(RateWindow::from_str("1m"), Some(RateWindow::Minute));
+        assert_eq!(RateWindow::from_str("1w"), None);
+        assert_eq!(RateScope::from_str("npub"), Some(RateScope::Npub));
+        assert_eq!(RateScope::from_str("ip"), Some(RateScope::Ip));
+        assert_eq!(RateScope::from_str("global"), Some(RateScope::Global));
     }
 }

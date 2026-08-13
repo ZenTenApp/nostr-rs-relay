@@ -1,0 +1,36 @@
+{
+  "kinds": {
+    "whitelist": [4]
+  },
+  "4": {
+    "description": "Private kind-4 DMs: privileged, expiring, authenticated, rate-limited",
+
+    "write": { "allow": "*" },
+
+    "read": {
+      "allow": "*",
+      "privileged": true
+    },
+
+    "require_auth": true,
+
+    "max_size": "4KB",
+    "max_expiration": "75h",
+
+    "p_tag": "hex",
+    "required_tags": ["expiration", "client"],
+
+    "rate_limits": [
+      { "limit": 100,  "window": "1h", "scope": "npub" },
+      { "limit": 1000, "window": "1d", "scope": "npub" },
+      { "limit": 300,  "window": "1h", "scope": "ip" },
+      { "limit": 2500, "window": "1d", "scope": "ip" }
+    ],
+
+    "tag_limits": {
+      "max_tags": 32,
+      "max_tag_name_chars": 32,
+      "max_tag_value_chars": 128
+    }
+  }
+}
