@@ -378,10 +378,8 @@ Useful commands:
   sudo journalctl -f -u nostr-rs-relay
   sudo systemctl restart nostr-rs-relay
 
-To upgrade later:
-  cd ${BUILD_DIR} && git pull && cargo build --release
-  sudo cp target/release/nostr-rs-relay /usr/local/bin/
-  sudo systemctl restart nostr-rs-relay
+To upgrade later (from a linux/amd64 machine with root SSH):
+  ./scripts/deploy.sh --host ${DOMAIN} --key ~/.ssh/id_ed25519
 
 Connect a Nostr client to: wss://${DOMAIN}
 EOF

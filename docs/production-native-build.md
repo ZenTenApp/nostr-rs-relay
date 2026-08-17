@@ -51,14 +51,26 @@ cargo build --release -j1
 
 The release binary is at `target/release/nostr-rs-relay`.
 
-To upgrade later, pull the latest changes, rebuild, and restart the service:
+To upgrade an existing server, install over SSH as root with
+[`scripts/deploy.sh`](../scripts/deploy.sh). On a host with no prior
+layout it also installs a **root** systemd unit, `config.toml`, and
+`contrib/kinds.json.example` (no nginx or TLS). After that, later runs
+replace only the binary; an existing `config.toml` is left in place.
+
+On linux/amd64 it builds locally. From macOS (or any other machine) it
+rsyncs the tree to the first `--host` and runs `cargo build --release
+--locked -j1` there, then installs the binary.
 
 ```bash
-git pull
-cargo build --release
-sudo cp target/release/nostr-rs-relay /usr/local/bin/
-sudo systemctl restart nostr-rs-relay
+./scripts/deploy.sh \
+  --host relay.example.com \
+  --key ~/.ssh/id_ed25519
 ```
+
+Pass `--binary` to skip cargo and ship a file you already have. Repeat
+`--host` to install the same binary on more servers. Use `--no-restart` to
+install without bouncing systemd. On failure the previous binary is left at
+`/usr/local/bin/nostr-rs-relay.prev`.
 
 ## 4. Create system user and directories
 
@@ -306,6 +318,7 @@ For authenticated clients, enable `[authorization] nip42_auth`. See
 
 ## Related documentation
 
+- [`scripts/deploy.sh`](../scripts/deploy.sh) — upgrade an existing host over SSH
 - [Run as a Linux System Process](run-as-linux-system-process.md) — minimal systemd setup
 - [Reverse Proxy](reverse-proxy.md) — HAProxy, nginx, and Traefik examples
 - [Database Maintenance](database-maintenance.md) — vacuum, pruning, and backups
