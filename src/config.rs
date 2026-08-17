@@ -416,6 +416,8 @@ pub struct WriteReadConfig {
     pub allow: AccessRule,            // Allow rule (defaults to All)
     pub deny: AccessRule,              // Deny rule (defaults to None)
     pub privileged: bool, // If true on read: AUTH'd author + p-tagged; allow list takes precedence
+    /// Optional NIP-01 OK message when this write/read rule denies access.
+    pub error: Option<String>,
 }
 
 /// Per-kind filter configuration
@@ -434,6 +436,8 @@ pub struct KindFilterConfig {
     pub d_tag: TagRequirement,
     pub p_tag: TagRequirement,
     pub required_tags: Vec<String>,
+    /// Optional per-check NIP-01 OK message overrides (see KIND_FILTERS.md).
+    pub errors: HashMap<String, String>,
 }
 
 /// Kind filters configuration container
@@ -442,6 +446,8 @@ pub struct KindFilters {
     pub config_file: Option<String>,
     pub whitelist: Option<Vec<u64>>,
     pub blacklist: Option<Vec<u64>>,
+    /// Optional global error message overrides under `kinds.errors`.
+    pub errors: HashMap<String, String>,
     pub filters: HashMap<u64, KindFilterConfig>,
 }
 
@@ -452,8 +458,24 @@ impl KindFilters {
             config_file: None,
             whitelist: None,
             blacklist: None,
+            errors: HashMap::new(),
             filters: HashMap::new(),
         }
+    }
+
+    /// Parse an `errors` object of string keys to string values.
+    fn parse_errors_map(value: &serde_json::Value) -> Result<HashMap<String, String>, String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "errors must be an object of string keys to string values".to_string())?;
+        let mut map = HashMap::new();
+        for (k, v) in obj {
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("errors.{k} must be a string"))?;
+            map.insert(k.clone(), s.to_string());
+        }
+        Ok(map)
     }
 
     /// Load kind filters from JSON file
@@ -467,8 +489,9 @@ impl KindFilters {
         let mut filters = HashMap::new();
         let mut whitelist: Option<Vec<u64>> = None;
         let mut blacklist: Option<Vec<u64>> = None;
+        let mut errors = HashMap::new();
 
-        // Parse kinds object: { "kinds": { "whitelist": [...], "blacklist": [...] } }
+        // Parse kinds object: { "kinds": { "whitelist": [...], "blacklist": [...], "errors": {...} } }
         if let Some(kinds_value) = json.get("kinds") {
             let kinds_obj = kinds_value
                 .as_object()
@@ -504,6 +527,9 @@ impl KindFilters {
                     blacklist = Some(bl);
                 }
             }
+            if let Some(errors_value) = kinds_obj.get("errors") {
+                errors = Self::parse_errors_map(errors_value)?;
+            }
         }
 
         // Collect all kind numbers from the JSON keys (excluding "kinds")
@@ -532,6 +558,7 @@ impl KindFilters {
             config_file: Some(file_path.to_string()),
             whitelist,
             blacklist,
+            errors,
             filters,
         })
     }
@@ -570,11 +597,17 @@ impl WriteReadConfig {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let error = obj
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Ok(WriteReadConfig {
             script,
             allow,
             deny,
             privileged,
+            error,
         })
     }
 }
@@ -664,6 +697,11 @@ impl KindFilterConfig {
 
         let tag_limits = obj.get("tag_limits").and_then(TagLimits::from_json_value);
 
+        let errors = match obj.get("errors") {
+            None => HashMap::new(),
+            Some(v) => KindFilters::parse_errors_map(v)?,
+        };
+
         Ok(KindFilterConfig {
             description,
             write,
@@ -678,6 +716,7 @@ impl KindFilterConfig {
             d_tag,
             p_tag,
             required_tags,
+            errors,
         })
     }
 }
@@ -1012,6 +1051,30 @@ mod tests {
         assert_eq!(tl.max_tag_name_chars, 16);
         assert_eq!(tl.max_tag_value_chars, 128);
         assert!(tl.enabled());
+    }
+
+    #[test]
+    fn parse_kind_config_with_errors_overrides() {
+        let json = serde_json::json!({
+            "write": {"allow": "*", "error": "restricted: custom write deny"},
+            "errors": {
+                "auth_required": "auth-required: please AUTH",
+                "max_size": "blocked: too big ({size} > {limit})"
+            }
+        });
+        let cfg = KindFilterConfig::from_json_value(&json).unwrap();
+        assert_eq!(
+            cfg.write.as_ref().and_then(|w| w.error.as_deref()),
+            Some("restricted: custom write deny")
+        );
+        assert_eq!(
+            cfg.errors.get("auth_required").map(String::as_str),
+            Some("auth-required: please AUTH")
+        );
+        assert_eq!(
+            cfg.errors.get("max_size").map(String::as_str),
+            Some("blocked: too big ({size} > {limit})")
+        );
     }
 
     #[test]

@@ -120,11 +120,33 @@ async fn kind_filter_write_enforcement() -> Result<()> {
     };
     let now = unix_time();
 
+    // Drain the NIP-42 AUTH challenge sent on connect so publish() sees OK.
+    {
+        let frame = ws.next().await.expect("expected AUTH challenge").unwrap();
+        let text = frame.into_text().unwrap().to_string();
+        let v: serde_json::Value = serde_json::from_str(&text)?;
+        assert_eq!(v[0], "AUTH", "expected AUTH challenge on connect, got: {text}");
+    }
+
     // 1. Kind 1 is not on the whitelist -> rejected.
     let mut ok1 = dm_event(&keys, vec![], "hello");
     ok1.kind = 1;
+    // Re-sign after changing kind so we hit the whitelist check, not ID validation.
+    {
+        let secp = Secp256k1::new();
+        let c = ok1.to_canonical().unwrap();
+        let digest: sha256::Hash = sha256::Hash::hash(c.as_bytes());
+        let msg = secp256k1::Message::from_slice(digest.as_ref()).unwrap();
+        let sig = secp.sign_schnorr(&msg, &keys.0);
+        ok1.id = format!("{digest:x}");
+        ok1.sig = sig.to_hex();
+    }
     let (_, accepted, msg) = publish(&mut ws, &ok1).await?;
     assert!(!accepted, "kind 1 should be rejected by whitelist; msg={msg}");
+    assert_eq!(
+        msg, "blocked: kind 1 is not in the kind whitelist",
+        "whitelist rejection message; got={msg}"
+    );
 
     // 2. Kind 4, unauthenticated -> rejected (require_auth).
     let noauth = dm_event(
@@ -138,6 +160,16 @@ async fn kind_filter_write_enforcement() -> Result<()> {
     );
     let (_, accepted, msg) = publish(&mut ws, &noauth).await?;
     assert!(!accepted, "unauthenticated kind 4 should be rejected; msg={msg}");
+    assert_eq!(
+        msg, "auth-required: authentication required to publish this kind",
+        "require_auth rejection message; got={msg}"
+    );
+    ws.close(None).await?;
+
+    // Reconnect and AUTH so later checks exercise tag/size/expiration, not require_auth.
+    let (mut ws, _res) = connect_async(format!("ws://localhost:{}", relay.port)).await?;
+    let authed = authenticate(&mut ws, &keys).await?;
+    assert_eq!(authed, keys.1.to_hex());
 
     // 3. Missing required tag "client" -> rejected.
     let missing_client = dm_event(
@@ -150,6 +182,10 @@ async fn kind_filter_write_enforcement() -> Result<()> {
     );
     let (_, accepted, msg) = publish(&mut ws, &missing_client).await?;
     assert!(!accepted, "missing client tag should be rejected; msg={msg}");
+    assert_eq!(
+        msg, "invalid: missing required tag: client",
+        "missing tag rejection message; got={msg}"
+    );
 
     // 4. Expiration too far in the future (> 75h) -> rejected.
     let far_exp = dm_event(
@@ -163,6 +199,10 @@ async fn kind_filter_write_enforcement() -> Result<()> {
     );
     let (_, accepted, msg) = publish(&mut ws, &far_exp).await?;
     assert!(!accepted, "far-future expiration should be rejected; msg={msg}");
+    assert_eq!(
+        msg, "blocked: expiration exceeds max_expiry_duration",
+        "max_expiration rejection message; got={msg}"
+    );
 
     // 5. Oversized content (> 4KB) -> rejected.
     let big = dm_event(
@@ -176,7 +216,14 @@ async fn kind_filter_write_enforcement() -> Result<()> {
     );
     let (_, accepted, msg) = publish(&mut ws, &big).await?;
     assert!(!accepted, "oversized kind 4 should be rejected; msg={msg}");
-
+    assert!(
+        msg.starts_with("blocked: event exceeds size limit ("),
+        "max_size rejection message; got={msg}"
+    );
+    assert!(
+        msg.contains(" > 4096)"),
+        "max_size should report limit 4096; got={msg}"
+    );
     ws.close(None).await?;
     shutdown(&relay).await;
     Ok(())

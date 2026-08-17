@@ -3,8 +3,9 @@ use crate::config::{RateScope, Settings};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::kind_filters::{
-    check_write_read_config, is_kind_allowed, validate_d_tag, validate_expiration_window,
-    validate_p_tag, validate_required_tags,
+    check_kind_allowed, check_write_read_config, resolve_error_message, validate_d_tag,
+    validate_expiration_window, validate_p_tag, validate_required_tags, ErrorPlaceholders,
+    KindDenyReason,
 };
 use crate::nauthz;
 use crate::notice::Notice;
@@ -471,14 +472,35 @@ pub async fn db_writer(
         }
 
         // Check kind whitelist/blacklist first
-        if !is_kind_allowed(event.kind, &settings.kind_filters) {
+        if let Err(deny_reason) = check_kind_allowed(event.kind, &settings.kind_filters) {
+            let (key, default) = match deny_reason {
+                KindDenyReason::NotInWhitelist => (
+                    "not_in_whitelist",
+                    "blocked: kind {kind} is not in the kind whitelist",
+                ),
+                KindDenyReason::Blacklisted => (
+                    "blacklisted",
+                    "blocked: kind {kind} is blacklisted",
+                ),
+            };
+            let placeholders = ErrorPlaceholders {
+                kind: Some(event.kind),
+                ..Default::default()
+            };
+            let msg = resolve_error_message(
+                default,
+                None,
+                settings.kind_filters.errors.get(key).map(String::as_str),
+                &placeholders,
+            );
             debug!(
-                "rejecting event: {} (kind: {}), reason: kind not allowed by whitelist/blacklist",
+                "rejecting event: {} (kind: {}), reason: {}",
                 event.get_event_id_prefix(),
-                event.kind
+                event.kind,
+                msg
             );
             notice_tx
-                .try_send(Notice::blocked(event.id, "kind not allowed by whitelist/blacklist"))
+                .try_send(Notice::from_reason(event.id, &msg))
                 .ok();
             continue;
         }
@@ -487,6 +509,12 @@ pub async fn db_writer(
         if let Some(filter_config) = settings.kind_filters.filters.get(&event.kind) {
             // Get server pubkey from settings if available
             let server_pubkey = settings.info.pubkey.as_deref();
+            let kind_errors = &filter_config.errors;
+            let global_errors = &settings.kind_filters.errors;
+            let kind_ph = ErrorPlaceholders {
+                kind: Some(event.kind),
+                ..Default::default()
+            };
 
             // Check write access using new structure
             if let Some(ref write_config) = filter_config.write {
@@ -499,13 +527,23 @@ pub async fn db_writer(
                 );
 
                 if !write_allowed {
+                    let msg = resolve_error_message(
+                        "restricted: pubkey is not allowed to write this kind",
+                        write_config
+                            .error
+                            .as_deref()
+                            .or_else(|| kind_errors.get("write").map(String::as_str)),
+                        global_errors.get("write").map(String::as_str),
+                        &kind_ph,
+                    );
                     debug!(
-                        "rejecting event: {} (kind: {}), reason: write not allowed by kind filter",
+                        "rejecting event: {} (kind: {}), reason: {}",
                         event.get_event_id_prefix(),
-                        event.kind
+                        event.kind,
+                        msg
                     );
                     notice_tx
-                        .try_send(Notice::blocked(event.id, "write not allowed by kind filter"))
+                        .try_send(Notice::from_reason(event.id, &msg))
                         .ok();
                     continue;
                 }
@@ -513,13 +551,20 @@ pub async fn db_writer(
 
             // Require NIP-42 authentication for publishing this kind
             if filter_config.require_auth && auth_pubkey_str.is_none() {
+                let msg = resolve_error_message(
+                    "auth-required: authentication required to publish this kind",
+                    kind_errors.get("auth_required").map(String::as_str),
+                    global_errors.get("auth_required").map(String::as_str),
+                    &kind_ph,
+                );
                 debug!(
-                    "rejecting event: {} (kind: {}), authentication required",
+                    "rejecting event: {} (kind: {}), reason: {}",
                     event.get_event_id_prefix(),
-                    event.kind
+                    event.kind,
+                    msg
                 );
                 notice_tx
-                    .try_send(Notice::blocked(event.id, "authentication required to publish this kind"))
+                    .try_send(Notice::from_reason(event.id, &msg))
                     .ok();
                 continue;
             }
@@ -528,6 +573,18 @@ pub async fn db_writer(
             if let Some(max_size) = filter_config.max_size {
                 let event_json = serde_json::to_string(&event).unwrap_or_default();
                 if event_json.len() > max_size {
+                    let placeholders = ErrorPlaceholders {
+                        kind: Some(event.kind),
+                        size: Some(event_json.len()),
+                        limit: Some(max_size),
+                        ..Default::default()
+                    };
+                    let msg = resolve_error_message(
+                        "blocked: event exceeds size limit ({size} > {limit})",
+                        kind_errors.get("max_size").map(String::as_str),
+                        global_errors.get("max_size").map(String::as_str),
+                        &placeholders,
+                    );
                     debug!(
                         "rejecting event: {} (kind: {}), size {} exceeds limit {}",
                         event.get_event_id_prefix(),
@@ -536,10 +593,7 @@ pub async fn db_writer(
                         max_size
                     );
                     notice_tx
-                        .try_send(Notice::blocked(
-                            event.id,
-                            &format!("event size exceeds limit of {} bytes", max_size),
-                        ))
+                        .try_send(Notice::from_reason(event.id, &msg))
                         .ok();
                     continue;
                 }
@@ -547,37 +601,69 @@ pub async fn db_writer(
 
             // Check tag requirements
             if !validate_d_tag(&event, &filter_config.d_tag) {
+                let msg = resolve_error_message(
+                    "invalid: missing d tag",
+                    kind_errors.get("d_tag").map(String::as_str),
+                    global_errors.get("d_tag").map(String::as_str),
+                    &kind_ph,
+                );
                 debug!(
-                    "rejecting event: {} (kind: {}), d tag requirement not met",
+                    "rejecting event: {} (kind: {}), reason: {}",
                     event.get_event_id_prefix(),
-                    event.kind
+                    event.kind,
+                    msg
                 );
                 notice_tx
-                    .try_send(Notice::blocked(event.id, "d tag requirement not met"))
+                    .try_send(Notice::from_reason(event.id, &msg))
                     .ok();
                 continue;
             }
 
             if !validate_p_tag(&event, &filter_config.p_tag) {
-                debug!(
-                    "rejecting event: {} (kind: {}), p tag requirement not met",
-                    event.get_event_id_prefix(),
-                    event.kind
+                let msg = resolve_error_message(
+                    "invalid: p tag requirement not met",
+                    kind_errors.get("p_tag").map(String::as_str),
+                    global_errors.get("p_tag").map(String::as_str),
+                    &kind_ph,
                 );
-                notice_tx
-                    .try_send(Notice::blocked(event.id, "p tag requirement not met"))
-                    .ok();
-                continue;
-            }
-
-            if let Err(msg) = validate_required_tags(&event, &filter_config.required_tags) {
                 debug!(
-                    "rejecting event: {} (kind: {}), {}",
+                    "rejecting event: {} (kind: {}), reason: {}",
                     event.get_event_id_prefix(),
                     event.kind,
                     msg
                 );
-                notice_tx.try_send(Notice::blocked(event.id, &msg)).ok();
+                notice_tx
+                    .try_send(Notice::from_reason(event.id, &msg))
+                    .ok();
+                continue;
+            }
+
+            if let Err(detail) = validate_required_tags(&event, &filter_config.required_tags) {
+                // detail is "missing required tag: {tag}" — extract tag for placeholder
+                let tag = detail
+                    .strip_prefix("missing required tag: ")
+                    .unwrap_or("")
+                    .to_string();
+                let placeholders = ErrorPlaceholders {
+                    kind: Some(event.kind),
+                    tag: if tag.is_empty() { None } else { Some(tag) },
+                    ..Default::default()
+                };
+                let msg = resolve_error_message(
+                    "invalid: missing required tag: {tag}",
+                    kind_errors.get("missing_tag").map(String::as_str),
+                    global_errors.get("missing_tag").map(String::as_str),
+                    &placeholders,
+                );
+                debug!(
+                    "rejecting event: {} (kind: {}), reason: {}",
+                    event.get_event_id_prefix(),
+                    event.kind,
+                    msg
+                );
+                notice_tx
+                    .try_send(Notice::from_reason(event.id, &msg))
+                    .ok();
                 continue;
             }
 
@@ -605,14 +691,27 @@ pub async fn db_writer(
                         }
                     }
                 }
-                if let Some(msg) = tag_err {
+                if let Some(detail) = tag_err {
+                    let placeholders = ErrorPlaceholders {
+                        kind: Some(event.kind),
+                        detail: Some(detail.clone()),
+                        ..Default::default()
+                    };
+                    let msg = resolve_error_message(
+                        "invalid: {detail}",
+                        kind_errors.get("tag_limits").map(String::as_str),
+                        global_errors.get("tag_limits").map(String::as_str),
+                        &placeholders,
+                    );
                     debug!(
-                        "rejecting event: {} (kind: {}), {}",
+                        "rejecting event: {} (kind: {}), reason: {}",
                         event.get_event_id_prefix(),
                         event.kind,
                         msg
                     );
-                    notice_tx.try_send(Notice::blocked(event.id, &msg)).ok();
+                    notice_tx
+                        .try_send(Notice::from_reason(event.id, &msg))
+                        .ok();
                     continue;
                 }
             }
@@ -623,13 +722,20 @@ pub async fn db_writer(
                 let now = crate::utils::unix_time();
                 let expiration_time = event.created_at + expiration_duration.as_secs();
                 if now > expiration_time {
+                    let msg = resolve_error_message(
+                        "blocked: event has expired",
+                        kind_errors.get("expired").map(String::as_str),
+                        global_errors.get("expired").map(String::as_str),
+                        &kind_ph,
+                    );
                     debug!(
-                        "rejecting event: {} (kind: {}), event has expired",
+                        "rejecting event: {} (kind: {}), reason: {}",
                         event.get_event_id_prefix(),
-                        event.kind
+                        event.kind,
+                        msg
                     );
                     notice_tx
-                        .try_send(Notice::blocked(event.id, "event has expired"))
+                        .try_send(Notice::from_reason(event.id, &msg))
                         .ok();
                     continue;
                 }
@@ -639,14 +745,33 @@ pub async fn db_writer(
             // further in the future than the configured maximum allowed window, or is
             // present but not a valid numeric timestamp.
             if let Some(max_exp_duration) = filter_config.max_expiration.duration {
-                if let Err(msg) = validate_expiration_window(&event, max_exp_duration) {
+                if let Err(detail) = validate_expiration_window(&event, max_exp_duration) {
+                    let (key, default) = if detail.contains("valid timestamp") {
+                        (
+                            "expiration_invalid",
+                            "invalid: expiration tag is not a valid timestamp",
+                        )
+                    } else {
+                        (
+                            "expiration",
+                            "blocked: expiration exceeds max_expiry_duration",
+                        )
+                    };
+                    let msg = resolve_error_message(
+                        default,
+                        kind_errors.get(key).map(String::as_str),
+                        global_errors.get(key).map(String::as_str),
+                        &kind_ph,
+                    );
                     debug!(
-                        "rejecting event: {} (kind: {}), {}",
+                        "rejecting event: {} (kind: {}), reason: {}",
                         event.get_event_id_prefix(),
                         event.kind,
                         msg
                     );
-                    notice_tx.try_send(Notice::blocked(event.id, &msg)).ok();
+                    notice_tx
+                        .try_send(Notice::from_reason(event.id, &msg))
+                        .ok();
                     continue;
                 }
             }
@@ -654,13 +779,20 @@ pub async fn db_writer(
             // Check per-kind rate limit (legacy global per-minute)
             if let Some(rate_limiter) = kind_rate_limiters.get(&event.kind) {
                 if rate_limiter.check().is_err() {
+                    let msg = resolve_error_message(
+                        "rate-limited: rate limit exceeded for this kind",
+                        kind_errors.get("rate_limited").map(String::as_str),
+                        global_errors.get("rate_limited").map(String::as_str),
+                        &kind_ph,
+                    );
                     debug!(
-                        "rejecting event: {} (kind: {}), rate limit exceeded",
+                        "rejecting event: {} (kind: {}), reason: {}",
                         event.get_event_id_prefix(),
-                        event.kind
+                        event.kind,
+                        msg
                     );
                     notice_tx
-                        .try_send(Notice::blocked(event.id, "rate limit exceeded for this kind"))
+                        .try_send(Notice::from_reason(event.id, &msg))
                         .ok();
                     continue;
                 }
@@ -681,13 +813,20 @@ pub async fn db_writer(
                     }
                 }
                 if exceeded {
+                    let msg = resolve_error_message(
+                        "rate-limited: rate limit exceeded for this kind",
+                        kind_errors.get("rate_limited").map(String::as_str),
+                        global_errors.get("rate_limited").map(String::as_str),
+                        &kind_ph,
+                    );
                     debug!(
-                        "rejecting event: {} (kind: {}), sliding rate limit exceeded",
+                        "rejecting event: {} (kind: {}), reason: {}",
                         event.get_event_id_prefix(),
-                        event.kind
+                        event.kind,
+                        msg
                     );
                     notice_tx
-                        .try_send(Notice::blocked(event.id, "rate limit exceeded for this kind"))
+                        .try_send(Notice::from_reason(event.id, &msg))
                         .ok();
                     continue;
                 }

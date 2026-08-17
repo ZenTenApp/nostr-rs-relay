@@ -31,6 +31,16 @@
       "max_tags": 32,
       "max_tag_name_chars": 32,
       "max_tag_value_chars": 128
+    },
+
+    "errors": {
+      "auth_required": "auth-required: authentication required to publish this kind",
+      "max_size": "blocked: event exceeds size limit ({size} > {limit})",
+      "missing_tag": "invalid: missing required tag: {tag}",
+      "p_tag": "invalid: p tag requirement not met",
+      "expiration": "blocked: expiration exceeds max_expiry_duration",
+      "rate_limited": "rate-limited: rate limit exceeded for this kind",
+      "tag_limits": "invalid: {detail}"
     }
   }
 }

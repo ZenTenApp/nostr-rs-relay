@@ -107,30 +107,96 @@ pub fn validate_expiration_window(event: &Event, max_duration: Duration) -> Resu
         return Ok(());
     }
     let Some(event_exp) = event.expiration() else {
-        return Err("invalid expiration tag".to_string());
+        return Err("expiration tag is not a valid timestamp".to_string());
     };
     let now = crate::utils::unix_time();
     let max_allowed = now + max_duration.as_secs();
     if event_exp > max_allowed {
-        return Err("expiration tag exceeds maximum allowed duration".to_string());
+        return Err("expiration exceeds max_expiry_duration".to_string());
     }
+    Ok(())
+}
+
+/// Why a kind was rejected by the global whitelist/blacklist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KindDenyReason {
+    NotInWhitelist,
+    Blacklisted,
+}
+
+/// Check if a kind is allowed based on whitelist/blacklist.
+///
+/// Returns `Ok(())` when allowed, or `Err(KindDenyReason)` when denied.
+pub fn check_kind_allowed(kind: u64, filters: &KindFilters) -> Result<(), KindDenyReason> {
+    if let Some(ref whitelist) = filters.whitelist {
+        if whitelist.contains(&kind) {
+            return Ok(());
+        }
+        return Err(KindDenyReason::NotInWhitelist);
+    }
+
+    if let Some(ref blacklist) = filters.blacklist {
+        if blacklist.contains(&kind) {
+            return Err(KindDenyReason::Blacklisted);
+        }
+        return Ok(());
+    }
+
     Ok(())
 }
 
 /// Check if a kind is allowed based on whitelist/blacklist
 pub fn is_kind_allowed(kind: u64, filters: &KindFilters) -> bool {
-    // If whitelist is present, only allow whitelisted kinds
-    if let Some(ref whitelist) = filters.whitelist {
-        return whitelist.contains(&kind);
+    check_kind_allowed(kind, filters).is_ok()
+}
+
+/// Placeholders available in kinds.json error overrides.
+#[derive(Debug, Clone, Default)]
+pub struct ErrorPlaceholders {
+    pub kind: Option<u64>,
+    pub tag: Option<String>,
+    pub size: Option<usize>,
+    pub limit: Option<usize>,
+    pub detail: Option<String>,
+}
+
+/// Resolve an error message template with optional overrides.
+///
+/// Lookup order for the template: `kind_override` → `global_override` → `default`.
+/// Substitutes `{kind}`, `{tag}`, `{size}`, `{limit}`, and `{detail}`.
+#[must_use]
+pub fn resolve_error_message(
+    default: &str,
+    kind_override: Option<&str>,
+    global_override: Option<&str>,
+    placeholders: &ErrorPlaceholders,
+) -> String {
+    let template = kind_override
+        .or(global_override)
+        .unwrap_or(default);
+    substitute_placeholders(template, placeholders)
+}
+
+/// Substitute known placeholders in an error template.
+#[must_use]
+pub fn substitute_placeholders(template: &str, placeholders: &ErrorPlaceholders) -> String {
+    let mut out = template.to_string();
+    if let Some(kind) = placeholders.kind {
+        out = out.replace("{kind}", &kind.to_string());
     }
-    
-    // If only blacklist is present, deny blacklisted kinds
-    if let Some(ref blacklist) = filters.blacklist {
-        return !blacklist.contains(&kind);
+    if let Some(ref tag) = placeholders.tag {
+        out = out.replace("{tag}", tag);
     }
-    
-    // If neither is present, allow all
-    true
+    if let Some(size) = placeholders.size {
+        out = out.replace("{size}", &size.to_string());
+    }
+    if let Some(limit) = placeholders.limit {
+        out = out.replace("{limit}", &limit.to_string());
+    }
+    if let Some(ref detail) = placeholders.detail {
+        out = out.replace("{detail}", detail);
+    }
+    out
 }
 
 /// Execute a script and return whether it allows the event
@@ -287,6 +353,7 @@ mod tests {
             allow: AccessRule::All, // does not short-circuit privileged
             deny: AccessRule::None,
             privileged: true,
+            error: None,
         }
     }
 
@@ -362,6 +429,7 @@ mod tests {
             allow: AccessRule::List(vec![allowed_extra.clone()]),
             deny: AccessRule::None,
             privileged: true,
+            error: None,
         };
 
         // Allowlisted pubkey (neither author nor p-tagged) can read
@@ -440,6 +508,7 @@ mod tests {
             allow: AccessRule::All,
             deny: AccessRule::List(vec![recipient.clone()]),
             privileged: true,
+            error: None,
         };
 
         assert!(!check_write_read_config(
@@ -449,6 +518,37 @@ mod tests {
             None,
             true
         ));
+    }
+
+    #[test]
+    fn substitute_placeholders_replaces_known_keys() {
+        let placeholders = ErrorPlaceholders {
+            kind: Some(4),
+            tag: Some("client".into()),
+            size: Some(5000),
+            limit: Some(4096),
+            detail: Some("too many tags".into()),
+        };
+        let msg = substitute_placeholders(
+            "kind {kind} tag {tag} size {size}/{limit}: {detail}",
+            &placeholders,
+        );
+        assert_eq!(msg, "kind 4 tag client size 5000/4096: too many tags");
+    }
+
+    #[test]
+    fn resolve_error_prefers_kind_override() {
+        let placeholders = ErrorPlaceholders {
+            kind: Some(4),
+            ..Default::default()
+        };
+        let msg = resolve_error_message(
+            "blocked: kind {kind} is not in the kind whitelist",
+            Some("restricted: custom kind {kind}"),
+            Some("blocked: global {kind}"),
+            &placeholders,
+        );
+        assert_eq!(msg, "restricted: custom kind 4");
     }
 }
 

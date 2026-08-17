@@ -200,7 +200,7 @@ This is useful for preventing clients from publishing events that would be store
 
 - This is **optional**. If absent or set to `"never"`, no limit is enforced.
 - Only events that **have** a NIP-40 `expiration` tag are checked. Events with no expiration tag are **not** affected.
-- If an `expiration` tag is present but its value is not a valid numeric timestamp, the event is rejected (`invalid expiration tag`). This prevents bypassing the window cap with a non-numeric value.
+- If an `expiration` tag is present but its value is not a valid numeric timestamp, the event is rejected (`invalid: expiration tag is not a valid timestamp`). This prevents bypassing the window cap with a non-numeric value.
 - Uses the same duration string format as `expiration`.
 
 Examples:
@@ -218,7 +218,7 @@ Examples:
 }
 ```
 
-Rejection notice sent to client: `expiration tag exceeds maximum allowed duration`
+Rejection OK message: `blocked: expiration exceeds max_expiry_duration`
 
 ## Max Size
 
@@ -405,7 +405,66 @@ List of arbitrary tag names that must be present on the event. Each listed tag m
 }
 ```
 
-If a required tag is missing, the event is rejected with a notice like `missing required tag: title`.
+If a required tag is missing, the event is rejected with
+`invalid: missing required tag: title`.
+
+## Rejection OK Messages
+
+When a kind-filter check rejects an event, the relay responds with a NIP-01
+`["OK", id, false, "<prefix>: <detail>"]` message. Defaults follow orly-style
+prefixes:
+
+| Check | Default OK message |
+| --- | --- |
+| Kind not in whitelist | `blocked: kind {kind} is not in the kind whitelist` |
+| Kind blacklisted | `blocked: kind {kind} is blacklisted` |
+| Write allow/deny | `restricted: pubkey is not allowed to write this kind` |
+| `require_auth` | `auth-required: authentication required to publish this kind` |
+| `max_size` | `blocked: event exceeds size limit ({size} > {limit})` |
+| `required_tags` | `invalid: missing required tag: {tag}` |
+| `p_tag` | `invalid: p tag requirement not met` |
+| `d_tag` | `invalid: missing d tag` |
+| Invalid expiration tag | `invalid: expiration tag is not a valid timestamp` |
+| `max_expiration` | `blocked: expiration exceeds max_expiry_duration` |
+| Kind `expiration` elapsed | `blocked: event has expired` |
+| Tag limits | `invalid: {detail}` |
+| Rate limits | `rate-limited: rate limit exceeded for this kind` |
+
+### Optional overrides
+
+You can override any of these strings under `kinds.errors` (global) or a
+per-kind `errors` object. `write.error` / `read.error` override write/read
+denials for that section. Placeholders: `{kind}`, `{tag}`, `{size}`, `{limit}`,
+`{detail}`. If the override already includes a NIP-01 prefix (`blocked:`,
+`invalid:`, `auth-required:`, etc.), it is sent as-is.
+
+```json
+{
+  "kinds": {
+    "whitelist": [4],
+    "errors": {
+      "not_in_whitelist": "blocked: kind {kind} is not in the kind whitelist"
+    }
+  },
+  "4": {
+    "write": {
+      "allow": "*",
+      "error": "restricted: not allowed to write kind 4"
+    },
+    "errors": {
+      "auth_required": "auth-required: authentication required to publish this kind",
+      "max_size": "blocked: event exceeds size limit ({size} > {limit})",
+      "missing_tag": "invalid: missing required tag: {tag}",
+      "expiration": "blocked: expiration exceeds max_expiry_duration",
+      "rate_limited": "rate-limited: rate limit exceeded for this kind"
+    }
+  }
+}
+```
+
+Keys: `not_in_whitelist`, `blacklisted`, `write`, `auth_required`, `max_size`,
+`missing_tag`, `p_tag`, `d_tag`, `expiration`, `expiration_invalid`, `expired`,
+`rate_limited`, `tag_limits`.
 
 ## Global Kind Whitelist/Blacklist
 
