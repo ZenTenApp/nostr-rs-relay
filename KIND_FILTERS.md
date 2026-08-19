@@ -180,6 +180,8 @@ Examples:
 - `"7d"` - Expire after 7 days
 - `"30 days"` - Expire after 30 days
 
+The configured `expiration` is a **server-side TTL**: the event is computed to expire at `created_at + expiration` and is rejected at publish time if that time has already passed, and excluded from read results once it has. Separately, an event's NIP-40 `expiration` tag value is honored on the read path too: an event whose `expiration` tag has passed is excluded from queries/delivery in addition to being filtered out by the stored `expires_at` column, so read results never include an expired event.
+
 ```json
 {
   "1": {

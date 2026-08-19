@@ -3,7 +3,6 @@ use nostr_rs_relay::error::{Error, Result};
 use nostr_rs_relay::event::{single_char_tagname, Event};
 use nostr_rs_relay::repo::sqlite::{build_pool, PooledConnection};
 use nostr_rs_relay::repo::sqlite_migration::{curr_db_version, DB_VERSION};
-use nostr_rs_relay::utils::is_lower_hex;
 use rusqlite::params;
 use rusqlite::{OpenFlags, Transaction};
 use std::io;
@@ -149,20 +148,14 @@ fn write_event(tx: &Transaction, e: Event) -> Result<usize> {
         }
         // safe because len was > 1
         let tagval = t.get(1).unwrap();
-        // insert as BLOB if we can restore it losslessly.
-        // this means it needs to be even length and lowercase.
-        if (tagval.len() % 2 == 0) && is_lower_hex(tagval) {
-            tx.execute(
-                "INSERT INTO tag (event_id, name, value_hex) VALUES (?1, ?2, ?3);",
-                params![event_id, tagname, hex::decode(tagval).ok()],
-            )?;
-        } else {
-            // otherwise, insert as text
-            tx.execute(
-                "INSERT INTO tag (event_id, name, value) VALUES (?1, ?2, ?3);",
-                params![event_id, tagname, &tagval],
-            )?;
-        }
+        // Current schema (v16+) stores tag values as text with the required
+        // `kind` and `created_at` NOT NULL columns; the old value_hex-style
+        // insert omitted them and hit a NOT NULL constraint, silently
+        // dropping tags while the event row committed.
+        tx.execute(
+            "INSERT INTO tag (event_id, name, value, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5);",
+            params![event_id, tagname, &tagval, e.kind, e.created_at],
+        )?;
     }
     if e.is_replaceable() {
         //let query = "SELECT id FROM event WHERE kind=? AND author=? ORDER BY created_at DESC LIMIT 1;";

@@ -1068,6 +1068,15 @@ fn allowed_to_send(event_str: &str, conn: &conn::ClientConn, settings: &Settings
         return false;
     }
 
+    // Exclude events whose NIP-40 `expiration` tag has already passed,
+    // independent of the stored `expires_at` column. The SQL layer filters
+    // on `expires_at`, but this provides defense-in-depth for realtime
+    // broadcasts and for any event whose stored column is absent/stale, so
+    // queries never return an event that the `expiration` tag has expired.
+    if event.is_expired() {
+        return false;
+    }
+
     // Check kind filter read access
     if let Some(filter_config) = settings.kind_filters.filters.get(&event.kind) {
         let auth_pubkey_str = conn.auth_pubkey().map(|s| s.as_str());
