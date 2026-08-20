@@ -101,7 +101,7 @@ collect_inputs() {
     prompt CERTBOT_EMAIL "Email address for Let's Encrypt certificate notifications"
     prompt RELAY_NAME "Relay display name" "My Nostr Relay"
     prompt RELAY_DESCRIPTION "Relay description" "A nostr-rs-relay instance."
-    prompt GIT_REPO "Git repository URL" "https://git.nostrdev.com/complex/nostr-rs-relay.git"
+    prompt GIT_REPO "Git repository URL" "https://github.com/ZenTenApp/nostr-rs-relay.git"
     prompt BUILD_DIR "Directory to clone and build the source" "/opt/nostr-rs-relay-src"
 
     echo

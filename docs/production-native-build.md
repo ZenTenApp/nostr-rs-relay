@@ -51,11 +51,12 @@ cargo build --release -j1
 
 The release binary is at `target/release/nostr-rs-relay`.
 
-To upgrade an existing server, install over SSH as root with
-[`scripts/deploy.sh`](../scripts/deploy.sh). On a host with no prior
-layout it also installs a **root** systemd unit, `config.toml`, and
-`contrib/kinds.json.example` (no nginx or TLS). After that, later runs
-replace only the binary; an existing `config.toml` is left in place.
+To install or upgrade over SSH as root, use
+[`scripts/deploy.sh`](../scripts/deploy.sh). On a fresh Ubuntu host it creates
+an unprivileged, non-login `nostr` system user; installs the relay, config,
+and policy file; configures nginx; and obtains a Let's Encrypt certificate.
+On later deployments it checks each component individually, creates only missing
+resources, and preserves existing configuration and policy files.
 
 On linux/amd64 it builds locally. From macOS (or any other machine) it
 rsyncs the tree to the first `--host` and runs `cargo build --release
@@ -64,7 +65,9 @@ rsyncs the tree to the first `--host` and runs `cargo build --release
 ```bash
 ./scripts/deploy.sh \
   --host relay.example.com \
-  --key ~/.ssh/id_ed25519
+  --key ~/.ssh/id_ed25519 \
+  --domain relay.example.com \
+  --email admin@example.com
 ```
 
 Pass `--binary` to skip cargo and ship a file you already have. Repeat

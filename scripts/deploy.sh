@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# deploy.sh — Build a release binary and install it over SSH as root.
+# deploy.sh — Build a release binary and install a complete Ubuntu relay over SSH as root.
 #
-# First-time layout (no nginx/TLS): root systemd unit, config.toml, and
-# contrib/kinds.json.example. nginx/certbot remain in
-# contrib/production-native-build.sh. Existing config.toml is not overwritten.
+# On a fresh host this creates the non-login `nostr` system user, installs the
+# runtime layout, nginx, and a Let's Encrypt TLS certificate. Existing relay
+# configuration and policy files are preserved.
 #
 # Build modes (--build, default auto):
 #   auto    --binary if given; else local cargo on linux/amd64; else remote
@@ -20,16 +20,22 @@
 # Usage:
 #   ./scripts/deploy.sh \
 #       --host relay.example.com \
-#       --key ~/.ssh/id_ed25519
+#       --key ~/.ssh/id_ed25519 \
+#       --domain relay.example.com \
+#       --email admin@example.com
 #
 #   ./scripts/deploy.sh \
 #       --host relay.example.com \
 #       --key ~/.ssh/id_ed25519 \
+#       --domain relay.example.com \
+#       --email admin@example.com \
 #       --port 60022
 #
 #   ./scripts/deploy.sh \
 #       --host relay.example.com \
 #       --key ~/.ssh/id_ed25519 \
+#       --domain relay.example.com \
+#       --email admin@example.com \
 #       --binary ./target/release/nostr-rs-relay
 #
 # Flags (each also falls back to its $ENV unless overridden on the CLI):
@@ -37,6 +43,8 @@
 #   --key PATH         SSH private key (req; fallback SSH_KEY)
 #   --ip HOST          explicit IP/host to keyscan (fallback DEPLOY_IP)
 #   --port N           ssh port (default 22; fallback DEPLOY_PORT)
+#   --domain DOMAIN    public relay domain for nginx/TLS (req; fallback RELAY_DOMAIN)
+#   --email EMAIL      Let's Encrypt notification email (req; fallback CERTBOT_EMAIL)
 #   --restart          restart service after install (default)
 #   --no-restart       do not restart the service
 #   --remote-bin PATH  remote binary path (default /usr/local/bin/nostr-rs-relay)
@@ -59,6 +67,8 @@ DEPLOY_KEY="${SSH_KEY:-}"
 SSH_USER="root"
 DEPLOY_IP="${DEPLOY_IP:-}"
 DEPLOY_PORT="${DEPLOY_PORT:-22}"
+DOMAIN="${RELAY_DOMAIN:-}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 RESTART=true
 REMOTE_BIN="${REMOTE_BIN:-/usr/local/bin/nostr-rs-relay}"
 REMOTE_SRC="${REMOTE_SRC:-/opt/nostr-rs-relay-src}"
@@ -159,6 +169,22 @@ while [[ $# -gt 0 ]]; do
             DEPLOY_PORT="$2"
             shift 2
             ;;
+        --domain)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                err "--domain requires a public domain name."
+                exit 1
+            fi
+            DOMAIN="$2"
+            shift 2
+            ;;
+        --email)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                err "--email requires a Let's Encrypt notification email."
+                exit 1
+            fi
+            CERTBOT_EMAIL="$2"
+            shift 2
+            ;;
         --restart)
             RESTART=true
             shift
@@ -234,6 +260,14 @@ done
 if [[ ${#HOSTS[@]} -eq 0 ]]; then
     err "No target host(s) given. Use --host <host> (repeatable)."
     echo "Try: $0 --help"
+    exit 1
+fi
+if [[ -z "$DOMAIN" || ! "$DOMAIN" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]; then
+    err "A valid public --domain is required for nginx and TLS."
+    exit 1
+fi
+if [[ -z "$CERTBOT_EMAIL" || ! "$CERTBOT_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+    err "A valid --email is required for Let's Encrypt notifications."
     exit 1
 fi
 
@@ -500,9 +534,8 @@ REMOTE
     chmod 755 "$BUILD_OUTPUT"
 }
 
-# First-run layout: root systemd unit, config.toml, committed kinds example.
-# Does not create a `nostr` user and does not install nginx or TLS.
-# Existing config.toml is left in place; kinds.json is installed if missing.
+# First-run layout: a non-login service account, relay configuration and policy,
+# plus a hardened systemd service. Existing config.toml and kinds.json survive.
 ensure_remote_runtime() {
     local host="$1"
     local config_dir kinds_dir unit_path
@@ -510,36 +543,47 @@ ensure_remote_runtime() {
     kinds_dir="$(dirname "$REMOTE_KINDS")"
     unit_path="/etc/systemd/system/${SERVICE}.service"
 
-    log "  Ensuring runtime layout (root, no nginx/TLS)..."
-    ssh_run "$host" "mkdir -p '${config_dir}' '${kinds_dir}' '${REMOTE_DATA}'"
+    log "  Ensuring non-login nostr user and runtime layout..."
+    ssh_run "$host" "bash -s" <<REMOTE
+set -euo pipefail
+id nostr >/dev/null 2>&1 || useradd --system --home '${REMOTE_DATA}' --shell /usr/sbin/nologin nostr
+mkdir -p '${config_dir}' '${kinds_dir}' '${REMOTE_DATA}'
+chown -R nostr:nostr '${REMOTE_DATA}'
+REMOTE
 
     if ssh_run "$host" "test -f '${REMOTE_KINDS}'"; then
-        ok "  Keeping existing kinds file: ${REMOTE_KINDS}"
+        ok "  Keeping existing policy file: ${REMOTE_KINDS}"
     else
-        log "  Installing kinds.json from contrib/kinds.json.example..."
+        log "  Installing policy file from contrib/kinds.json.example..."
         scp_put "$LOCAL_KINDS_EXAMPLE" "${SSH_USER}@${host}:${REMOTE_KINDS}"
-        ssh_run "$host" "chmod 644 '${REMOTE_KINDS}'"
         ok "  Installed ${REMOTE_KINDS}"
     fi
 
     if ssh_run "$host" "test -f '${REMOTE_CONFIG}'"; then
         ok "  Keeping existing config: ${REMOTE_CONFIG}"
     else
-        log "  Installing config.toml (ws://${host}:${LISTEN_PORT}/, kinds example)..."
+        log "  Installing and configuring production config template..."
         scp_put "$LOCAL_CONFIG" "${SSH_USER}@${host}:${REMOTE_CONFIG}"
         ssh_run "$host" "bash -s" <<REMOTE
 set -euo pipefail
 cfg='${REMOTE_CONFIG}'
-sed -i "s|^relay_url = .*|relay_url = \\"ws://${host}:${LISTEN_PORT}/\\"|" "\$cfg"
-sed -i "s|^address = .*|address = \\"0.0.0.0\\"|" "\$cfg"
-sed -i "s|^port = .*|port = ${LISTEN_PORT}|" "\$cfg"
-sed -i "s|^config_file = .*|config_file = \\"${REMOTE_KINDS}\\"|" "\$cfg"
-chmod 644 "\$cfg"
+sed -i 's|^relay_url = .*|relay_url = "wss://${DOMAIN}/"|' "\$cfg"
+sed -i 's|^address = .*|address = "127.0.0.1"|' "\$cfg"
+sed -i 's|^port = .*|port = ${LISTEN_PORT}|' "\$cfg"
+sed -i 's|^config_file = .*|config_file = "${REMOTE_KINDS}"|' "\$cfg"
+grep -q '^remote_ip_header' "\$cfg" || sed -i '/^\[network\]/a remote_ip_header = "x-forwarded-for"' "\$cfg"
+chown root:nostr "\$cfg" '${REMOTE_KINDS}'
+chmod 640 "\$cfg" '${REMOTE_KINDS}'
 REMOTE
         ok "  Installed ${REMOTE_CONFIG}"
     fi
 
-    log "  Installing systemd unit (User=root)..."
+    if ssh_run "$host" "test -f '${unit_path}'"; then
+        ok "  Keeping existing systemd unit: ${unit_path}"
+        return
+    fi
+
+    log "  Installing systemd unit (User=nostr)..."
     ssh_run "$host" "cat > '${unit_path}'" <<UNIT
 [Unit]
 Description=nostr-rs-relay
@@ -548,16 +592,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=nostr
+Group=nostr
 WorkingDirectory=${REMOTE_DATA}
 Environment=RUST_LOG=warn,nostr_rs_relay=info
 ExecStart=${REMOTE_BIN} --config ${REMOTE_CONFIG} --db ${REMOTE_DATA}
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
-
 NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=${REMOTE_DATA}
 
@@ -565,7 +610,65 @@ ReadWritePaths=${REMOTE_DATA}
 WantedBy=multi-user.target
 UNIT
     ssh_run "$host" "systemctl daemon-reload && systemctl enable '${SERVICE}'"
-    ok "  systemd unit ${SERVICE} enabled (root)."
+    ok "  systemd unit ${SERVICE} enabled (nostr non-login user)."
+}
+
+# Configure each nginx/TLS component only when it is missing. Routine deploys
+# therefore do not rewrite a working proxy configuration or invoke certbot.
+setup_nginx_tls() {
+    local host="$1"
+    log "  Checking nginx and Let's Encrypt TLS for ${DOMAIN}..."
+    ssh_run "$host" "DOMAIN='${DOMAIN}' SERVICE='${SERVICE}' LISTEN_PORT='${LISTEN_PORT}' CERTBOT_EMAIL='${CERTBOT_EMAIL}' bash -s" <<'REMOTE'
+set -euo pipefail
+site="/etc/nginx/sites-available/${SERVICE}"
+cert="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+
+if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
+    command -v apt-get >/dev/null 2>&1 || { echo 'Ubuntu/Debian apt-get is required.' >&2; exit 1; }
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y nginx certbot python3-certbot-nginx
+fi
+
+if [[ ! -f "$site" ]]; then
+    cat > "$site" <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    location / {
+        proxy_pass http://127.0.0.1:${LISTEN_PORT};
+        proxy_http_version 1.1;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+NGINX
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sfn "$site" "/etc/nginx/sites-enabled/${SERVICE}"
+    nginx -t
+    systemctl enable --now nginx
+    systemctl reload nginx
+    echo "Created nginx site: $site"
+else
+    echo "Keeping existing nginx site: $site"
+fi
+
+if [[ ! -f "$cert" ]]; then
+    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$CERTBOT_EMAIL" --redirect
+    systemctl reload nginx
+    echo "TLS certificate obtained."
+else
+    echo "Keeping existing TLS certificate: $cert"
+fi
+REMOTE
+    ok "  nginx/TLS requirements are present."
 }
 
 describe_binary() {
@@ -636,7 +739,10 @@ for host in "${HOSTS[@]}"; do
     ssh_run "$host" "mkdir -p '$(dirname "$REMOTE_BIN")'"
     scp_put "$BUILD_OUTPUT" "${SSH_USER}@${host}:${REMOTE_BIN}"
     ssh_run "$host" "chmod 755 '${REMOTE_BIN}'"
+
+    # Each setup helper checks its own resources and creates only what is absent.
     ensure_remote_runtime "$host"
+    setup_nginx_tls "$host"
 
     if [[ "$RESTART" == "true" ]]; then
         log "  Starting service..."
@@ -658,4 +764,26 @@ for host in "${HOSTS[@]}"; do
 done
 
 assert_default_identity_untouched
+
+printf '\n'
 ok "Deployment complete."
+cat <<EOF
+
+Deployment summary
+  Relay URL:       wss://${DOMAIN}/
+  Hosts:           ${HOSTS[*]}
+  Service:         ${SERVICE}.service (runs as non-login user: nostr)
+  Executable:      ${REMOTE_BIN}
+  Configuration:   ${REMOTE_CONFIG}
+  Policy file:     ${REMOTE_KINDS}
+  Data / database: ${REMOTE_DATA}
+  nginx site:      /etc/nginx/sites-available/${SERVICE}
+  TLS certificates:/etc/letsencrypt/live/${DOMAIN}/
+
+Useful commands (run on a server):
+  systemctl status ${SERVICE}
+  journalctl -fu ${SERVICE}
+  systemctl restart ${SERVICE}
+  nginx -t && systemctl reload nginx
+  certbot renew --dry-run
+EOF
