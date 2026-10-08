@@ -31,6 +31,7 @@ fn write_kind_config() -> Result<std::path::PathBuf> {
         "max_expiration": "75h",
         "p_tag": "hex",
         "required_tags": ["expiration", "client"],
+        "tag_patterns": { "client": "^[a-z-]+$" },
         "tag_limits": { "max_tags": 32, "max_tag_name_chars": 32, "max_tag_value_chars": 128 },
         "rate_limits": [
           { "limit": 100, "window": "1h", "scope": "npub" },
@@ -187,7 +188,24 @@ async fn kind_filter_write_enforcement() -> Result<()> {
         "missing tag rejection message; got={msg}"
     );
 
-    // 4. Expiration too far in the future (> 75h) -> rejected.
+    // 4. A configured tag-pattern mismatch -> rejected.
+    let invalid_client = dm_event(
+        &keys,
+        vec![
+            vec!["p".into(), recipient.clone()],
+            vec!["expiration".into(), (now + 3600).to_string()],
+            vec!["client".into(), "INVALID!".into()],
+        ],
+        "secret",
+    );
+    let (_, accepted, msg) = publish(&mut ws, &invalid_client).await?;
+    assert!(!accepted, "invalid client tag should be rejected; msg={msg}");
+    assert_eq!(
+        msg, "invalid: tag client value does not match configured pattern",
+        "tag pattern rejection message; got={msg}"
+    );
+
+    // 5. Expiration too far in the future (> 75h) -> rejected.
     let far_exp = dm_event(
         &keys,
         vec![
@@ -204,7 +222,7 @@ async fn kind_filter_write_enforcement() -> Result<()> {
         "max_expiration rejection message; got={msg}"
     );
 
-    // 5. Oversized content (> 4KB) -> rejected.
+    // 6. Oversized content (> 4KB) -> rejected.
     let big = dm_event(
         &keys,
         vec![

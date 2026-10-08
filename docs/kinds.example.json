@@ -19,6 +19,9 @@
 
     "p_tag": "hex",
     "required_tags": ["expiration", "client"],
+    "tag_patterns": {
+      "client": "^[a-zA-Z0-9._-]{1,64}$"
+    },
 
     "rate_limits": [
       { "limit": 100,  "window": "1h", "scope": "npub" },

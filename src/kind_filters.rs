@@ -2,8 +2,10 @@
 use crate::config::{AccessRule, KindFilters, TagRequirement, WriteReadConfig};
 use crate::event::Event;
 use log::debug;
-use std::process::{Command, Stdio};
+use regex::Regex;
+use std::collections::HashMap;
 use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Evaluate a special access identifier
@@ -84,6 +86,23 @@ pub fn validate_required_tags(event: &Event, required_tags: &[String]) -> Result
     for tag_name in required_tags {
         if event.tag_values_by_name(tag_name).is_empty() {
             return Err(format!("missing required tag: {}", tag_name));
+        }
+    }
+    Ok(())
+}
+
+/// Validate configured tag-value patterns.
+///
+/// A configured tag is required to occur at least once with a value, and the
+/// first value of every occurrence must match its regular expression.
+pub fn validate_tag_patterns(
+    event: &Event,
+    tag_patterns: &HashMap<String, Regex>,
+) -> Result<(), String> {
+    for (tag_name, pattern) in tag_patterns {
+        let values = event.tag_values_by_name(tag_name);
+        if values.is_empty() || values.iter().any(|value| !pattern.is_match(value)) {
+            return Err(tag_name.clone());
         }
     }
     Ok(())
@@ -469,6 +488,24 @@ mod tests {
         assert!(check_write_read_config(
             &config, &event, None, None, false
         ));
+    }
+
+    #[test]
+    fn tag_patterns_require_present_matching_values() {
+        let author = "a".repeat(64);
+        let mut event = test_event(&author, &[]);
+        let patterns = HashMap::from([(
+            "d".to_string(),
+            Regex::new(r"^[a-z0-9][a-z0-9-]{2,63}$").unwrap(),
+        )]);
+
+        assert_eq!(validate_tag_patterns(&event, &patterns), Err("d".into()));
+
+        event.tags = vec![vec!["d".into(), "valid-slug".into()]];
+        assert_eq!(validate_tag_patterns(&event, &patterns), Ok(()));
+
+        event.tags.push(vec!["d".into(), "INVALID".into()]);
+        assert_eq!(validate_tag_patterns(&event, &patterns), Err("d".into()));
     }
 
     #[test]

@@ -4,8 +4,8 @@ use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::kind_filters::{
     check_kind_allowed, check_write_read_config, resolve_error_message, validate_d_tag,
-    validate_expiration_window, validate_p_tag, validate_required_tags, ErrorPlaceholders,
-    KindDenyReason,
+    validate_expiration_window, validate_p_tag, validate_required_tags, validate_tag_patterns,
+    ErrorPlaceholders, KindDenyReason,
 };
 use crate::nauthz;
 use crate::notice::Notice;
@@ -653,6 +653,30 @@ pub async fn db_writer(
                     "invalid: missing required tag: {tag}",
                     kind_errors.get("missing_tag").map(String::as_str),
                     global_errors.get("missing_tag").map(String::as_str),
+                    &placeholders,
+                );
+                debug!(
+                    "rejecting event: {} (kind: {}), reason: {}",
+                    event.get_event_id_prefix(),
+                    event.kind,
+                    msg
+                );
+                notice_tx
+                    .try_send(Notice::from_reason(event.id, &msg))
+                    .ok();
+                continue;
+            }
+
+            if let Err(tag) = validate_tag_patterns(&event, &filter_config.tag_patterns) {
+                let placeholders = ErrorPlaceholders {
+                    kind: Some(event.kind),
+                    tag: Some(tag),
+                    ..Default::default()
+                };
+                let msg = resolve_error_message(
+                    "invalid: tag {tag} value does not match configured pattern",
+                    kind_errors.get("tag_pattern").map(String::as_str),
+                    global_errors.get("tag_pattern").map(String::as_str),
                     &placeholders,
                 );
                 debug!(

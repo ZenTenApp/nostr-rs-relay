@@ -2,6 +2,7 @@
 use crate::payment::Processor;
 use config::{Config, ConfigError, File};
 use log::info;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -436,6 +437,8 @@ pub struct KindFilterConfig {
     pub d_tag: TagRequirement,
     pub p_tag: TagRequirement,
     pub required_tags: Vec<String>,
+    /// Tag names mapped to compiled regular expressions for their first value.
+    pub tag_patterns: HashMap<String, Regex>,
     /// Optional per-check NIP-01 OK message overrides (see KIND_FILTERS.md).
     pub errors: HashMap<String, String>,
 }
@@ -679,6 +682,25 @@ impl KindFilterConfig {
             }
         };
 
+        let tag_patterns: HashMap<String, Regex> = match obj.get("tag_patterns") {
+            None => HashMap::new(),
+            Some(v) => {
+                let patterns = v.as_object().ok_or_else(|| {
+                    "tag_patterns must be an object of tag names to regex strings".to_string()
+                })?;
+                let mut compiled = HashMap::with_capacity(patterns.len());
+                for (tag_name, pattern_value) in patterns {
+                    let pattern = pattern_value
+                        .as_str()
+                        .ok_or_else(|| format!("tag_patterns.{tag_name} must be a regex string"))?;
+                    let regex = Regex::new(pattern)
+                        .map_err(|e| format!("invalid regex for tag_patterns.{tag_name}: {e}"))?;
+                    compiled.insert(tag_name.clone(), regex);
+                }
+                compiled
+            }
+        };
+
         let require_auth = obj
             .get("require_auth")
             .and_then(|v| v.as_bool())
@@ -716,6 +738,7 @@ impl KindFilterConfig {
             d_tag,
             p_tag,
             required_tags,
+            tag_patterns,
             errors,
         })
     }
@@ -1016,6 +1039,10 @@ mod tests {
             "max_expiration": "75h",
             "p_tag": "hex",
             "required_tags": ["expiration", "client"],
+            "tag_patterns": {
+                "d": "^[a-z0-9][a-z0-9-]{2,63}$",
+                "client": "^(web|mobile)$"
+            },
             "rate_limits": [
                 {"limit": 300, "window": "1h", "scope": "npub"},
                 {"limit": 1000, "window": "1d", "scope": "ip"},
@@ -1036,6 +1063,9 @@ mod tests {
         );
         assert_eq!(cfg.p_tag, TagRequirement::RequiredHex);
         assert_eq!(cfg.required_tags, vec!["expiration", "client"]);
+        assert!(cfg.tag_patterns["d"].is_match("valid-slug"));
+        assert!(!cfg.tag_patterns["d"].is_match("Invalid Slug"));
+        assert!(cfg.tag_patterns["client"].is_match("web"));
 
         assert_eq!(cfg.rate_limits.len(), 3);
         assert_eq!(cfg.rate_limits[0].limit, 300);
@@ -1051,6 +1081,21 @@ mod tests {
         assert_eq!(tl.max_tag_name_chars, 16);
         assert_eq!(tl.max_tag_value_chars, 128);
         assert!(tl.enabled());
+    }
+
+    #[test]
+    fn reject_invalid_tag_pattern_config() {
+        let invalid_regex = serde_json::json!({
+            "tag_patterns": {"d": "["}
+        });
+        let err = KindFilterConfig::from_json_value(&invalid_regex).unwrap_err();
+        assert!(err.contains("invalid regex for tag_patterns.d"));
+
+        let invalid_shape = serde_json::json!({
+            "tag_patterns": ["d"]
+        });
+        let err = KindFilterConfig::from_json_value(&invalid_shape).unwrap_err();
+        assert!(err.contains("tag_patterns must be an object"));
     }
 
     #[test]

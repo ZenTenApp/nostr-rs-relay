@@ -164,6 +164,7 @@ Each kind number (as a string) can have its own configuration section:
 - **`d_tag`** (optional) - Requirement for `d` tag (see Tag Requirements section)
 - **`p_tag`** (optional) - Requirement for `p` tag (see Tag Requirements section)
 - **`required_tags`** (optional) - List of tag names that must be present (see Tag Requirements section)
+- **`tag_patterns`** (optional) - Map of required tag names to regular expressions for their values (see Tag Patterns section)
 
 ## Expiration
 
@@ -410,6 +411,30 @@ List of arbitrary tag names that must be present on the event. Each listed tag m
 If a required tag is missing, the event is rejected with
 `invalid: missing required tag: title`.
 
+## Tag Patterns
+
+Validate tag values with Rust regular expressions. `tag_patterns` is an object
+whose keys are tag names and whose values are regex strings:
+
+```json
+{
+  "30023": {
+    "tag_patterns": {
+      "d": "^[a-z0-9][a-z0-9-]{2,63}$"
+    }
+  }
+}
+```
+
+Each configured tag is required to be present with a value. If the event has
+multiple occurrences of that tag, the first value of **every occurrence** must
+match. Use `^` and `$` when the entire value must conform; otherwise regex
+matching may succeed on a substring. Invalid regexes prevent the kind-filter
+configuration from loading.
+
+A mismatch is rejected as
+`invalid: tag d value does not match configured pattern`.
+
 ## Rejection OK Messages
 
 When a kind-filter check rejects an event, the relay responds with a NIP-01
@@ -424,6 +449,7 @@ prefixes:
 | `require_auth` | `auth-required: authentication required to publish this kind` |
 | `max_size` | `blocked: event exceeds size limit ({size} > {limit})` |
 | `required_tags` | `invalid: missing required tag: {tag}` |
+| `tag_patterns` | `invalid: tag {tag} value does not match configured pattern` |
 | `p_tag` | `invalid: p tag requirement not met` |
 | `d_tag` | `invalid: missing d tag` |
 | Invalid expiration tag | `invalid: expiration tag is not a valid timestamp` |
@@ -465,8 +491,8 @@ denials for that section. Placeholders: `{kind}`, `{tag}`, `{size}`, `{limit}`,
 ```
 
 Keys: `not_in_whitelist`, `blacklisted`, `write`, `auth_required`, `max_size`,
-`missing_tag`, `p_tag`, `d_tag`, `expiration`, `expiration_invalid`, `expired`,
-`rate_limited`, `tag_limits`.
+`missing_tag`, `tag_pattern`, `p_tag`, `d_tag`, `expiration`,
+`expiration_invalid`, `expired`, `rate_limited`, `tag_limits`.
 
 ## Global Kind Whitelist/Blacklist
 
